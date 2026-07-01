@@ -1,0 +1,40 @@
+# ── Environment & Secrets ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Telethon Session Files ───────────────────────────────────────────
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+
+# ── Runtime State ────────────────────────────────────────────────────
+.progress_chat
+.pvtcopydl_*.json
+_pvtcopydl_tmp/
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── IDE / Editor ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────
+*.log
+
+# ── Local Config (contains channel IDs, not secrets, but user-specific)
+config.json
+.omc
