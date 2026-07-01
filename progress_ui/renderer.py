@@ -31,7 +31,7 @@ def escape_html(text: str) -> str:
 
 
 def box_line(content: str, width: int, style: BoxStyle | None = None) -> str:
-    """Wrap content in box side walls, padded to width."""
+    """Wrap content in box left wall, padded to width (no right border)."""
     s = style or DEFAULT_BOX_STYLE
     display_content = content[:width] if len(content) > width else content
     pad = max(0, width - len(display_content))
