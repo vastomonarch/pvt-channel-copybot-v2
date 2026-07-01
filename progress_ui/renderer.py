@@ -299,3 +299,96 @@ def render_delete_failed(
 
     body = escape_html("\n".join(lines))
     return f"<pre>{body}</pre>"
+
+
+# ── Simple Copy Progress (server-side, no download) ─────────────────
+
+
+def render_simple_copy_progress(
+    *,
+    spinner: Spinner,
+    channel: str,
+    start_id: int,
+    end_id: int,
+    copied: int,
+    skipped: int,
+    errors: int,
+    current_id: int,
+    elapsed: float = 0.0,
+    width: int = DEFAULT_BOX_WIDTH,
+) -> str:
+    """Render progress for server-side copy (no download/upload phases)."""
+    spin = spinner.next()
+    total = end_id - start_id + 1
+    done = max(0, current_id - start_id)
+    pct = (done / max(1, total)) * 100.0
+    bar = progress_bar(pct, width=20)
+    pct_str = format_percent(pct)
+
+    header = f"{spin} ⬇ Copying"
+    ch_display = channel[:28] if len(channel) > 28 else channel
+    ch_line = f"{ICON_CHANNEL} {ch_display}"
+    range_line = f"Range  {start_id} → {end_id}  ({total} msgs)"
+    progress_line = f"Current  {current_id} / {end_id}"
+    copied_line = f"Copied  {copied}"
+    skipped_line = f"Skipped  {skipped}"
+    errors_line = f"Errors  {errors}"
+    elapsed_line = f"{ICON_ELAPSED}  Elapsed  {format_time(elapsed)}"
+
+    lines = [
+        box_top(width),
+        box_line(header, width),
+        box_line(ch_line, width),
+        box_separator(width),
+        box_line(f"{bar}  {pct_str}", width),
+        box_line("", width),
+        box_line(range_line, width),
+        box_line(progress_line, width),
+        box_line("", width),
+        box_line(copied_line, width),
+        box_line(skipped_line, width),
+        box_line(errors_line, width),
+        box_separator(width),
+        box_line(elapsed_line, width),
+        box_bottom(width),
+    ]
+
+    body = escape_html("\n".join(lines))
+    return f"<pre>{body}</pre>"
+
+
+def render_simple_copy_completed(
+    *,
+    channel: str,
+    start_id: int,
+    end_id: int,
+    copied: int,
+    skipped: int,
+    errors: int,
+    elapsed: float,
+    width: int = DEFAULT_BOX_WIDTH,
+) -> str:
+    """Render completion screen for server-side copy."""
+    total = end_id - start_id + 1
+    bar = progress_bar(100.0, width=20)
+    ch_display = channel[:28] if len(channel) > 28 else channel
+
+    lines = [
+        box_top(width),
+        box_line(f"{ICON_COMPLETE} Copy Complete", width),
+        box_line(f"{ICON_CHANNEL} {ch_display}", width),
+        box_separator(width),
+        box_line(bar, width),
+        box_line("", width),
+        box_line(f"Range  {start_id} → {end_id}  ({total} msgs)", width),
+        box_line("", width),
+        box_line(f"Copied  {copied}", width),
+        box_line(f"Skipped  {skipped}", width),
+        box_line(f"Errors  {errors}", width),
+        box_separator(width),
+        box_line(f"{ICON_ELAPSED}  Completed in {format_time(elapsed)}", width),
+        box_bottom(width),
+    ]
+
+    body = escape_html("\n".join(lines))
+    return f"<pre>{body}</pre>"

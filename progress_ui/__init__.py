@@ -24,6 +24,13 @@ from progress_ui.renderer import (
     box_separator,
     box_top,
     escape_html,
+    render_copy_completed,
+    render_copy_progress,
+    render_delete_completed,
+    render_delete_failed,
+    render_delete_progress,
+    render_simple_copy_completed,
+    render_simple_copy_progress,
 )
 from progress_ui.spinner import Spinner
 

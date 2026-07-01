@@ -66,6 +66,8 @@ from progress_ui.renderer import (
     render_delete_completed,
     render_delete_failed,
     render_delete_progress,
+    render_simple_copy_completed,
+    render_simple_copy_progress,
 )
 
 # ===========================================================================
@@ -603,6 +605,16 @@ def _bot_buttons_for(job_key: str) -> list[list[Button]]:
     """Per-job refresh button (job_key encoded so refresh is unambiguous when
     multiple jobs are live).
     """
+    return [
+        [
+            Button.inline("🔄 Refresh", data=f"refresh:{job_key}".encode()),
+            Button.inline("⏹ Cancel", data=f"cancel:{job_key}".encode()),
+        ]
+    ]
+
+
+def _job_inline_buttons(job_key: str) -> list[list[Button]]:
+    """Inline buttons for job progress messages (user's chat)."""
     return [
         [
             Button.inline("🔄 Refresh", data=f"refresh:{job_key}".encode()),
@@ -1434,7 +1446,6 @@ async def handle_pvtcopydl(event):
             "speed_window": [],
             "download_speed_bps": 0.0,
             "bytes_downloaded_total": 0,
-            # Upload progress tracking
             "upload_phase": "idle",
             "upload_file_name": "",
             "upload_current": 0,
@@ -1443,16 +1454,10 @@ async def handle_pvtcopydl(event):
             "upload_bytes_total": 0,
             "upload_speed_window": [],
             "started_at": time.time(),
+            "_spinner": Spinner(),
         }
-        status_msg = await event.respond(
-            f"starting job {job_key}\n"
-            f"src: {src_identifier}  →  dst: {dest_channel_id}\n"
-            f"range: {start_msg_id}…{end_msg_id} ({total} msgs)\n"
-            f"live progress → @{BOT_USERNAME or 'bot'} (must /start it once)"
-        )
     else:
         state = prior
-        # ensure fresh schema fields exist on resume
         state.setdefault("speed_window", [])
         state.setdefault("download_speed_bps", 0.0)
         state.setdefault("bytes_downloaded_total", 0)
@@ -1463,22 +1468,35 @@ async def handle_pvtcopydl(event):
         state.setdefault("upload_speed_bps", 0.0)
         state.setdefault("upload_bytes_total", 0)
         state.setdefault("upload_speed_window", [])
+        state.setdefault("_spinner", Spinner())
         state["total"] = total
-        cur = state.get("current_msg_id", start_msg_id)
-        status_msg = await event.respond(
-            f"resuming job {job_key} from msg {cur} (saved checkpoint)"
-        )
 
-    # Send the live Bot progress message NOW so it is visible while the
-    # heavy download loop runs.  Falls back to user-account only if /start
-    # was not received yet - in that case we still respond with a hint.
-    progress_chat = get_progress_chat_id() or ME_ID
-    if bot_client is not None and progress_chat is not None:
-        sent_msg_id = await _send_initial_bot_progress(state, chat_id=progress_chat)
-        if sent_msg_id is None and not get_progress_chat_id():
-            log.warning(
-                "could not send live progress to bot - has anyone /started it yet?"
-            )
+    # Send initial progress message with inline buttons in user's chat
+    spinner = state["_spinner"]
+    channel_display = getattr(src_entity, "title", None) or str(src_identifier)
+    initial_text = render_copy_progress(
+        spinner=spinner,
+        mode="download",
+        job_key=job_key,
+        current_msg=state.get("current_msg_id", start_msg_id),
+        total=total,
+        downloaded=state.get("downloaded", 0),
+        uploaded=state.get("uploaded", 0),
+        skipped=state.get("skipped", 0),
+        errors=state.get("errors", 0),
+        speed=state.get("download_speed_bps", 0.0),
+        eta=0.0,
+        elapsed=0.0,
+        filename="",
+    )
+    status_msg = await event.respond(
+        initial_text,
+        buttons=_job_inline_buttons(job_key),
+    )
+    # Store chat_id and msg_id for inline button callbacks
+    state["progress_chat_id"] = event.chat_id
+    state["progress_msg_id"] = status_msg.id
+    state["progress_last_edit"] = time.monotonic()
 
     task = asyncio.current_task()
     ACTIVE_DL_JOBS[job_key] = task
@@ -1629,9 +1647,33 @@ async def handle_pvtcopy(event):
         await status_msg.edit(f"cannot access channel: {e}")
         return
     copied = skipped = errors = 0
-    bot_friendly_name = f"@{BOT_USERNAME}" if BOT_USERNAME else "the bot"
     log.info("pvtcopy START src=%s dst=%s range=%d..%d", src_identifier, dest_channel_id,
              start_msg_id, end_msg_id)
+
+    # Create job key and state for tracking
+    job_key = _job_key(src_identifier, start_msg_id, end_msg_id)
+    spinner = Spinner()
+    t0 = time.time()
+    last_edit_time = 0.0
+    last_edit_text = ""
+    channel_display = getattr(src_entity, "title", None) or str(src_identifier)
+
+    # Send initial progress message with inline buttons
+    initial_text = render_simple_copy_progress(
+        spinner=spinner,
+        channel=channel_display,
+        start_id=start_msg_id,
+        end_id=end_msg_id,
+        copied=copied,
+        skipped=skipped,
+        errors=errors,
+        current_id=start_msg_id,
+        elapsed=0.0,
+    )
+    status_msg = await event.respond(initial_text, buttons=_job_inline_buttons(job_key))
+    last_edit_time = time.monotonic()
+    last_edit_text = initial_text
+
     for msg_id in range(start_msg_id, end_msg_id + 1):
         try:
             messages = await client.get_messages(src_entity, ids=msg_id)
@@ -1659,10 +1701,6 @@ async def handle_pvtcopy(event):
                 skipped += 1
                 continue
             copied += 1
-            if copied % 10 == 0:
-                await status_msg.edit(
-                    f"copied: {copied}  skipped: {skipped}  errors: {errors}  (total {msg_count})"
-                )
         except FloodWaitError as e:
             wait_time = e.seconds + 5
             log.warning("flood-wait sleeping %ds", wait_time)
@@ -1674,11 +1712,50 @@ async def handle_pvtcopy(event):
         except Exception as e:
             log.error("pvtcopy error msg=%d err=%s", msg_id, e)
             errors += 1
-        # Minimal delay to avoid rate limits
+
+        # Rate-limited progress update: max every 2.5s and only if text changed
+        now = time.monotonic()
+        if now - last_edit_time >= 2.5:
+            elapsed = time.time() - t0
+            new_text = render_simple_copy_progress(
+                spinner=spinner,
+                channel=channel_display,
+                start_id=start_msg_id,
+                end_id=end_msg_id,
+                copied=copied,
+                skipped=skipped,
+                errors=errors,
+                current_id=msg_id,
+                elapsed=elapsed,
+            )
+            if new_text != last_edit_text:
+                try:
+                    await status_msg.edit(new_text, buttons=_job_inline_buttons(job_key))
+                    last_edit_text = new_text
+                    last_edit_time = now
+                except FloodWaitError as e:
+                    await asyncio.sleep(getattr(e, "seconds", 0) + 1)
+                except Exception:
+                    pass
+
+        # Brief pause to avoid rate limits
         await asyncio.sleep(random.uniform(0.1, 0.3))
-    await status_msg.edit(
-        f"copy complete\ncopied: {copied}  skipped: {skipped}  errors: {errors}\ndst: {dest_channel_id}"
+
+    # Final completion message
+    elapsed = time.time() - t0
+    final_text = render_simple_copy_completed(
+        channel=channel_display,
+        start_id=start_msg_id,
+        end_id=end_msg_id,
+        copied=copied,
+        skipped=skipped,
+        errors=errors,
+        elapsed=elapsed,
     )
+    try:
+        await status_msg.edit(final_text)
+    except Exception:
+        pass
     log.info("pvtcopy DONE copied=%d skipped=%d errors=%d", copied, skipped, errors)
 
 
@@ -2032,6 +2109,47 @@ async def _cancel_for(event, job_key: str | None) -> None:
         await event.respond(f"⏹ cancel requested for latest job `{key}`.")
     except Exception:
         pass
+
+
+# ===========================================================================
+# User-account inline button handlers  (progress in user's chat)
+# ===========================================================================
+@client.on(events.CallbackQuery(pattern=rb"refresh:(.+)"))
+async def _user_refresh(event):
+    """Handle Refresh button press in user's chat."""
+    job_key = event.pattern_match.group(1).decode()
+    state = ACTIVE_DL_STATES.get(job_key)
+    if state is None:
+        await event.answer("no live job found.", alert=False)
+        return
+    await event.answer("refreshing...")
+    # Force re-render the progress message
+    try:
+        spinner = state.get("_spinner")
+        if spinner is None:
+            from progress_ui import Spinner as _S
+            spinner = _S()
+            state["_spinner"] = spinner
+        chat_id = state.get("progress_chat_id")
+        msg_id = state.get("progress_msg_id")
+        if chat_id and msg_id:
+            text = _format_bot_status(state)
+            await client.edit_message(chat_id, msg_id, text, buttons=_job_inline_buttons(job_key))
+    except Exception as e:
+        log.debug("user refresh failed: %s", e)
+
+
+@client.on(events.CallbackQuery(pattern=rb"cancel:(.+)"))
+async def _user_cancel(event):
+    """Handle Cancel button press in user's chat."""
+    job_key = event.pattern_match.group(1).decode()
+    task = ACTIVE_DL_JOBS.get(job_key)
+    if task and not task.done():
+        task.cancel()
+        log.info("user cancel job=%s", job_key)
+        await event.answer(f"cancelling {job_key}...")
+    else:
+        await event.answer("job already finished.", alert=False)
 
 
 # ===========================================================================
