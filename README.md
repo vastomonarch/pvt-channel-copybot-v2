@@ -11,10 +11,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Telethon](https://img.shields.io/badge/Telethon-1.36+-purple.svg)](https://docs.telethon.dev/)
-[![GitHub Stars](https://img.shields.io/github/stars/your-username/pvt-channel-copybot-v2?style=social)](https://github.com/your-username/pvt-channel-copybot-v2)
-[![Last Commit](https://img.shields.io/github/last-commit/your-username/pvt-channel-copybot-v2)](https://github.com/your-username/pvt_channel_copybot_v2/commits)
-[![Issues](https://img.shields.io/github/issues/your-username/pvt-channel-copybot-v2)](https://github.com/your-username/pvt-channel-copybot-v2/issues)
-[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](https://github.com/your-username/pvt-channel-copybot-v2)
+[![GitHub Stars](https://img.shields.io/github/stars/vastomonarch/pvt-channel-copybot-v2?style=social)](https://github.com/vastomonarch/pvt-channel-copybot-v2)
+[![Last Commit](https://img.shields.io/github/last-commit/vastomonarch/pvt-channel-copybot-v2)](https://github.com/vastomonarch/pvt-channel-copybot-v2/commits)
+[![Issues](https://img.shields.io/github/issues/vastomonarch/pvt-channel-copybot-v2)](https://github.com/vastomonarch/pvt-channel-copybot-v2/issues)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](https://github.com/vastomonarch/pvt-channel-copybot-v2)
 
 </div>
 
@@ -218,5 +218,9 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 <div align="center">
 
 **If this project helps you, consider giving it a ⭐!**
+
+---
+
+📦 [View Repository](https://github.com/vastomonarch/pvt-channel-copybot-v2)
 
 </div>
