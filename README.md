@@ -206,8 +206,6 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
 
-**Why MIT?** The MIT License is permissive and widely used for Telegram/Telethon projects. It allows commercial use, modification, and distribution while protecting against liability.
-
 ## 🙏 Credits
 
 - [Telethon](https://docs.telethon.dev/) — Telegram client library
