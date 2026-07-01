@@ -247,14 +247,26 @@ def get_progress_chat_id() -> int | None:
 # ===========================================================================
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+# Default destination from .env (fallback if config.json missing)
+_ENV_DESTINATION = os.getenv("DESTINATION", "")
+
 
 def _load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
+        # Merge env destination if config has no destinations
+        if not cfg.get("destinations") and _ENV_DESTINATION:
+            cfg["destinations"] = [_ENV_DESTINATION]
+            cfg["selected"] = _ENV_DESTINATION
+            _save_config(cfg)
+        return cfg
+
+    # No config.json — build from env var or hardcoded fallback
+    dest = _ENV_DESTINATION or "-1003853787609"
     default = {
-        "destinations": ["-1003853787609"],
-        "selected": "-1003853787609",
+        "destinations": [dest],
+        "selected": dest,
     }
     _save_config(default)
     return default
