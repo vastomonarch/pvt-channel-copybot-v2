@@ -625,12 +625,10 @@ def _job_inline_buttons(job_key: str) -> list[list[Button]]:
 
 
 # ---------------------------------------------------------------------------
-# Live Bot progress editing
+# Live progress editing
 # ---------------------------------------------------------------------------
 async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
-    """Edit the Bot's progress message if enough time has elapsed (or force=True)."""
-    if bot_client is None:
-        return
+    """Edit the progress message. Uses bot_client if available, otherwise user client."""
     chat_id = state.get("progress_chat_id") or get_progress_chat_id() or ME_ID
     msg_id = state.get("progress_msg_id")
     if chat_id is None or msg_id is None:
@@ -639,8 +637,10 @@ async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
     last = state.get("progress_last_edit", 0.0)
     if not force and now - last < BOT_PROGRESS_EVERY_SEC:
         return
+    # Determine which client to use
+    edit_client = bot_client if bot_client is not None else client
     try:
-        await bot_client.edit_message(
+        await edit_client.edit_message(
             chat_id,
             msg_id,
             _format_bot_status(state),
@@ -650,7 +650,7 @@ async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
     except FloodWaitError as e:
         await asyncio.sleep(getattr(e, "seconds", 0) + 1)
     except Exception as e:  # message-not-modified and the like; ignore
-        log.debug("bot progress edit failed: %s", type(e).__name__)
+        log.debug("progress edit failed: %s", type(e).__name__)
 
 
 async def _send_initial_bot_progress(state: dict, chat_id: int) -> int | None:
