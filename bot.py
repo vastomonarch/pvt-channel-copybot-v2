@@ -1315,15 +1315,26 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
         except ChatAdminRequiredError as e:
             log.error("pvtcopydl hard-stop: destination requires admin")
             try:
-                await status_msg.edit(
-                    f"❌ pvtcopydl {job_key} cannot post to destination: {e}\n"
-                    "Make sure your account is admin of the destination channel.\n"
-                    f"Checkpoint saved at msg {msg_id} - re-issue after granting access."
+                elapsed = time.time() - state.get("started_at", time.time())
+                fail_text = render_copy_progress(
+                    spinner=state["_spinner"],
+                    mode="download",
+                    job_key=job_key,
+                    current_msg=state["current_msg_id"],
+                    total=total,
+                    downloaded=state.get("downloaded", 0),
+                    uploaded=state.get("uploaded", 0),
+                    skipped=state.get("skipped", 0),
+                    errors=state.get("errors", 0) + 1,
+                    speed=state.get("download_speed_bps", 0.0),
+                    eta=0.0,
+                    elapsed=elapsed,
+                    filename="",
                 )
+                await status_msg.edit(fail_text)
             except Exception:
                 pass
             _save_state(state)
-            await _finalise_bot_progress(state, success=False)
             return
         except (ConnectionError, asyncio.TimeoutError):
             retries += 1
@@ -1344,21 +1355,33 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
         processed += 1
         now = time.monotonic()
 
-        # Bot progress: every BOT_PROGRESS_EVERY_SEC (with throttling)
-        await _refresh_bot_progress(state)
-
-        # User-account status: only on milestones (not the live progress bar).
-        if processed % USER_STATUS_EDIT_EVERY == 0 or now - last_user_edit > 30:
+        # Direct progress edit via user client (throttled to every 2.5s)
+        if now - last_user_edit >= 2.5:
+            elapsed = time.time() - state.get("started_at", time.time())
             try:
-                await status_msg.edit(_format_status(state))
+                new_text = render_copy_progress(
+                    spinner=state["_spinner"],
+                    mode="download",
+                    job_key=job_key,
+                    current_msg=state["current_msg_id"],
+                    total=total,
+                    downloaded=state.get("downloaded", 0),
+                    uploaded=state.get("uploaded", 0),
+                    skipped=state.get("skipped", 0),
+                    errors=state.get("errors", 0),
+                    speed=state.get("download_speed_bps", 0.0),
+                    eta=_parse_eta_to_seconds(state.get("eta", ETA_NA)),
+                    elapsed=elapsed,
+                    filename=state.get("upload_file_name", ""),
+                )
+                await status_msg.edit(new_text, buttons=_job_inline_buttons(job_key))
                 last_user_edit = now
             except FloodWaitError as e:
                 await _send_wait_sleep(e)
             except Exception as e:
-                log.debug("user status edit failed: %s", e)
+                log.debug("progress edit failed: %s", type(e).__name__)
 
-        # Minimal delay to avoid Telegram rate limits; was 1.5-3s which
-        # severely bottlenecked throughput.
+        # Minimal delay to avoid Telegram rate limits
         await asyncio.sleep(random.uniform(0.1, 0.3))
 
 
@@ -1512,24 +1535,34 @@ async def handle_pvtcopydl(event):
     except asyncio.CancelledError:
         log.info("pvtcopydl CANCEL key=%s", job_key)
         try:
-            await status_msg.edit(
-                f"pvtcopydl {job_key} cancelled at msg {state.get('current_msg_id', '?')}.\n"
-                "checkpoint saved - re-issue the same command to resume."
+            elapsed = time.time() - state.get("started_at", time.time())
+            cancel_text = render_copy_progress(
+                spinner=state["_spinner"],
+                mode="download",
+                job_key=job_key,
+                current_msg=state.get("current_msg_id", start_msg_id),
+                total=total,
+                downloaded=state.get("downloaded", 0),
+                uploaded=state.get("uploaded", 0),
+                skipped=state.get("skipped", 0),
+                errors=state.get("errors", 0),
+                speed=0.0,
+                eta=0.0,
+                elapsed=elapsed,
+                filename="",
             )
+            await status_msg.edit(cancel_text)
         except Exception:
             pass
-        await _finalise_bot_progress(state, success=False)
         raise
     except Exception as e:
         log.exception("pvtcopydl CRASH key=%s err=%s", job_key, e)
         try:
             await status_msg.edit(
-                f"pvtcopydl {job_key} crashed: {e}\n"
-                "checkpoint saved - re-issue the same command to resume."
+                f"❌ pvtcopydl crashed: {e}\ncheckpoint saved — re-issue to resume."
             )
         except Exception:
             pass
-        await _finalise_bot_progress(state, success=False)
         return
     finally:
         ACTIVE_DL_JOBS.pop(job_key, None)
@@ -1537,6 +1570,7 @@ async def handle_pvtcopydl(event):
 
     try:
         tail_id = state["current_msg_id"]
+        elapsed = time.time() - state.get("started_at", time.time())
         if tail_id > end_msg_id:
             if state.get("uploaded", 0) > 0:
                 _clear_checkpoint(job_key)
@@ -1544,16 +1578,22 @@ async def handle_pvtcopydl(event):
                     "pvtcopydl DONE key=%s uploaded=%d errors=%d",
                     job_key, state.get("uploaded", 0), state.get("errors", 0),
                 )
-                await _finalise_bot_progress(state, success=True)
-                await status_msg.edit(
-                    f"pvtcopydl {job_key} complete\n" + _format_status(state)
+                # Show completion progress
+                final_text = render_copy_completed(
+                    mode="download",
+                    job_key=job_key,
+                    total=total,
+                    downloaded=state.get("downloaded", 0),
+                    uploaded=state.get("uploaded", 0),
+                    skipped=state.get("skipped", 0),
+                    errors=state.get("errors", 0),
+                    elapsed=elapsed,
                 )
+                await status_msg.edit(final_text)
             else:
                 log.warning("pvtcopydl DONE uploaded=0 - checkpoint kept")
-                await _finalise_bot_progress(state, success=False)
         else:
-            log.warning("pvtcopydl STOP key=%s tail=%d end=%d", job_key, tail_id, end_msg_id)
-            await _finalise_bot_progress(state, success=False)
+            log.warning("pvtcopydl STOP key=%s tail=%d end=%d", job_key, tail_id, end_id)
     except Exception as e:
         log.warning("final status update failed: %s", e)
 
