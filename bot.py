@@ -70,6 +70,18 @@ from progress_ui.renderer import (
     render_simple_copy_progress,
 )
 
+# ── Optimized Pipeline ──────────────────────────────────────────────
+from pipeline import (
+    Aria2cDownloader,
+    JobState,
+    TransferProgress,
+    cleanup_file,
+    download_with_progress,
+    render_job_buttons,
+    render_job_progress,
+    upload_with_progress,
+)
+
 # ===========================================================================
 # Logging  --  clean debug format
 # ===========================================================================
@@ -1175,9 +1187,15 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 state["upload_current"] = 0
                 state["upload_total"] = 0
 
-                t_dl_start = time.monotonic()
-                path, code, elapsed = await _redownload_media(cur, src_entity=src_entity)
-                t_dl_end = time.monotonic()
+                # Use pipeline download with progress tracking
+                dl_progress = state.setdefault("_dl_progress", TransferProgress())
+                dl_progress.phase = "downloading"
+                dl_progress.filename = file_name or f"msg_{msg_id}"
+                dl_progress.transferred_bytes = 0
+                dl_progress.start_time = time.monotonic()
+                path, code, elapsed = await download_with_progress(
+                    client, cur, str(JOB_DIR), dl_progress, src_entity=src_entity
+                )
                 log.info(
                     "DL msg=%d file=%s code=%d elapsed=%.2fs speed=%s",
                     msg_id, file_name or "?", code, elapsed,
@@ -1217,22 +1235,25 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 state["upload_phase"] = "uploading"
                 state["upload_current"] = 0
                 state["upload_total"] = os.path.getsize(path) if os.path.exists(path) else 0
-                await _refresh_bot_progress(state, force=True)
 
-                upload_cb = _make_upload_progress_callback(state)
+                # Use pipeline upload with progress tracking
+                ul_progress = state.setdefault("_ul_progress", TransferProgress())
+                ul_progress.phase = "uploading"
+                ul_progress.filename = file_name
+                ul_progress.transferred_bytes = 0
+                ul_progress.total_bytes = state["upload_total"]
+                ul_progress.start_time = time.monotonic()
                 sent = None
                 t_ul_start = time.monotonic()
                 for attempt in range(4):
                     try:
-                        sent = await client.send_file(
-                            entity=dst_entity,
-                            file=path,
+                        sent = await upload_with_progress(
+                            client, dst_entity, path, ul_progress,
                             caption=cur.message or None,
                             formatting_entities=cur.entities,
                             attributes=orig_attrs if orig_attrs else None,
                             mime_type=orig_mime,
                             supports_streaming=orig_streaming,
-                            progress_callback=upload_cb,
                         )
                         break
                     except (FloodWaitError, SlowModeWaitError) as e:
@@ -1248,7 +1269,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     except FileReferenceExpiredError:
                         retries += 1
                         state["retries"] = retries
-                        _safe_unlink(path)
+                        cleanup_file(path)
                         path2, code2, _ = await _redownload_media(cur, src_entity=src_entity)
                         if code2 == -1 or not path2:
                             errors += 1
