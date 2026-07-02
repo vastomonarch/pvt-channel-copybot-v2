@@ -363,7 +363,8 @@ def _checkpoint_path(job_key: str) -> pathlib.Path:
 
 
 def _save_checkpoint(job_key: str, state: dict) -> None:
-    payload = dict(state)
+    # Exclude non-serializable objects (Spinner, etc.)
+    payload = {k: v for k, v in state.items() if not k.startswith("_")}
     payload["updated_at"] = time.time()
     p = _checkpoint_path(job_key)
     tmp = str(p) + ".tmp"
