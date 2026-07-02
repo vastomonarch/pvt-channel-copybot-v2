@@ -122,13 +122,12 @@ def _set_log_level(level_name: str) -> None:
     log.info("log level overridden to %s", level_name)
 
 
-_set_log_level(os.getenv("LOG_LEVEL", ""))
-
-
 # ===========================================================================
 # Environment
 # ===========================================================================
 load_dotenv()
+
+_set_log_level(os.getenv("LOG_LEVEL", ""))
 
 API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "")
@@ -1374,12 +1373,14 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     elapsed=elapsed,
                     filename=state.get("upload_file_name", ""),
                 )
+                log.debug("editing progress msg=%d chat=%s", status_msg.id, state.get("progress_chat_id"))
                 await status_msg.edit(new_text, buttons=_job_inline_buttons(job_key))
                 last_user_edit = now
+                log.debug("progress edit OK")
             except FloodWaitError as e:
                 await _send_wait_sleep(e)
             except Exception as e:
-                log.debug("progress edit failed: %s", type(e).__name__)
+                log.warning("progress edit failed: %s %s", type(e).__name__, e)
 
         # Minimal delay to avoid Telegram rate limits
         await asyncio.sleep(random.uniform(0.1, 0.3))
