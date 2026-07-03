@@ -34,6 +34,7 @@ from telethon.errors import (
     ChannelPrivateError,
     MessageIdInvalidError,
     MessageDeleteForbiddenError,
+    MessageNotModifiedError,
     SlowModeWaitError,
     FileReferenceExpiredError,
     MediaEmptyError,
@@ -486,34 +487,6 @@ def _extract_document_attrs(msg):
     return attrs, mime_type, supports_streaming
 
 
-def _make_upload_progress_callback(state: dict):
-    """Create an async progress callback for send_file upload tracking.
-
-    The callback updates the state with upload progress and triggers
-    bot progress edits (throttled).
-    """
-    _last_cb_edit = [0.0]
-
-    async def _upload_cb(current: int, total: int) -> None:
-        state["upload_current"] = current
-        state["upload_total"] = total
-        # Track upload speed via rolling window
-        now = time.monotonic()
-        last_time = state.get("_upload_cb_last_time", 0.0)
-        last_bytes = state.get("_upload_cb_last_bytes", 0)
-        dt = now - last_time
-        if dt > 0.5 and current > last_bytes:
-            _update_upload_speed(state, current - last_bytes, dt)
-            state["_upload_cb_last_time"] = now
-            state["_upload_cb_last_bytes"] = current
-        # Throttled bot progress edit
-        if now - _last_cb_edit[0] >= BOT_PROGRESS_EVERY_SEC:
-            _last_cb_edit[0] = now
-            await _refresh_bot_progress(state)
-
-    return _upload_cb
-
-
 def _make_album_upload_progress_callback(state: dict, file_index: int, total_files: int):
     """Create a progress callback for individual files within an album."""
     _last_cb_edit = [0.0]
@@ -528,6 +501,28 @@ def _make_album_upload_progress_callback(state: dict, file_index: int, total_fil
             await _refresh_bot_progress(state)
 
     return _album_cb
+
+
+def _make_upload_progress_callback(state: dict):
+    """Create an async progress callback for send_file upload tracking."""
+    _last_cb_edit = [0.0]
+
+    async def _upload_cb(current: int, total: int) -> None:
+        state["upload_current"] = current
+        state["upload_total"] = total
+        now = time.monotonic()
+        last_time = state.get("_upload_cb_last_time", 0.0)
+        last_bytes = state.get("_upload_cb_last_bytes", 0)
+        dt = now - last_time
+        if dt > 0.5 and current > last_bytes:
+            _update_upload_speed(state, current - last_bytes, dt)
+            state["_upload_cb_last_time"] = now
+            state["_upload_cb_last_bytes"] = current
+        if now - _last_cb_edit[0] >= BOT_PROGRESS_EVERY_SEC:
+            _last_cb_edit[0] = now
+            await _refresh_bot_progress(state)
+
+    return _upload_cb
 
 
 # ---------------------------------------------------------------------------
@@ -555,25 +550,57 @@ def _format_bot_status(state: dict) -> str:
     """Rich Bot-message text with bar / ETA / speed / counters.
 
     Uses the progress_ui renderer for a professional terminal-style dashboard.
+    When a file transfer is active, shows file-level progress instead of
+    per-message progress.
     """
     spinner = state.setdefault("_spinner", Spinner())
     cur = state.get("current_msg_id", 0)
     start = state.get("start_msg_id", cur)
     end = state.get("end_msg_id", cur)
-    total = end - start + 1
-    speed = state.get("download_speed_bps", 0.0)
-    # Parse ETA string back to seconds for the renderer
-    eta_str = state.get("eta", ETA_NA)
-    eta_seconds = _parse_eta_to_seconds(eta_str)
+    total_msgs = end - start + 1
     elapsed = time.time() - state.get("started_at", time.time())
     filename = state.get("upload_file_name", "")
+    phase = state.get("upload_phase", "idle")
+
+    # If a file transfer is active, prefer file-level progress
+    if phase in ("downloading", "uploading"):
+        file_cur = state.get("upload_current", 0)
+        file_total = state.get("upload_total", 0)
+        speed = state.get("upload_speed_bps", 0.0) if phase == "uploading" else state.get("download_speed_bps", 0.0)
+        # Calculate ETA from file progress
+        if speed > 0 and file_total > file_cur > 0:
+            eta_seconds = (file_total - file_cur) / speed
+        else:
+            eta_seconds = 0.0
+        return render_copy_progress(
+            spinner=spinner,
+            mode=phase,
+            job_key=state.get("job_key", "?"),
+            current_msg=cur,
+            total=total_msgs,
+            downloaded=state.get("downloaded", 0),
+            uploaded=state.get("uploaded", 0),
+            skipped=state.get("skipped", 0),
+            errors=state.get("errors", 0),
+            speed=speed,
+            eta=eta_seconds,
+            elapsed=elapsed,
+            filename=filename,
+            file_current=file_cur,
+            file_total=file_total,
+        )
+
+    # Otherwise show message-level progress
+    speed = state.get("download_speed_bps", 0.0)
+    eta_str = state.get("eta", ETA_NA)
+    eta_seconds = _parse_eta_to_seconds(eta_str)
 
     return render_copy_progress(
         spinner=spinner,
         mode="download",
         job_key=state.get("job_key", "?"),
         current_msg=cur,
-        total=total,
+        total=total_msgs,
         downloaded=state.get("downloaded", 0),
         uploaded=state.get("uploaded", 0),
         skipped=state.get("skipped", 0),
@@ -639,7 +666,12 @@ def _job_inline_buttons(job_key: str) -> list[list[Button]]:
 # Live progress editing
 # ---------------------------------------------------------------------------
 async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
-    """Edit the progress message. Uses bot_client if available, otherwise user client."""
+    """Edit the progress message. Uses bot_client if available, otherwise user client.
+
+    Throttle: at most every BOT_PROGRESS_EVERY_SEC unless force=True.
+    Callers that already throttle (on_progress callbacks) should set force=True
+    to avoid double-throttling.
+    """
     chat_id = state.get("progress_chat_id") or get_progress_chat_id() or ME_ID
     msg_id = state.get("progress_msg_id")
     if chat_id is None or msg_id is None:
@@ -660,6 +692,8 @@ async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
         state["progress_last_edit"] = now
     except FloodWaitError as e:
         await asyncio.sleep(getattr(e, "seconds", 0) + 1)
+    except MessageNotModifiedError:
+        pass  # Telegram says the text is identical; harmless
     except Exception as e:  # message-not-modified and the like; ignore
         log.debug("progress edit failed: %s", type(e).__name__)
 
@@ -1193,8 +1227,17 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 dl_progress.filename = file_name or f"msg_{msg_id}"
                 dl_progress.transferred_bytes = 0
                 dl_progress.start_time = time.monotonic()
+                # ponytail: on_progress bridges pipeline callbacks → Telegram edits
+                async def _dl_on_progress(tp: TransferProgress) -> None:
+                    state["upload_phase"] = "downloading"
+                    state["upload_file_name"] = tp.filename
+                    state["upload_current"] = tp.transferred_bytes
+                    state["upload_total"] = tp.total_bytes
+                    state["download_speed_bps"] = tp.speed_bps
+                    await _refresh_bot_progress(state, force=True)
                 path, code, elapsed = await download_with_progress(
-                    client, cur, str(JOB_DIR), dl_progress, src_entity=src_entity
+                    client, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
+                    on_progress=_dl_on_progress,
                 )
                 log.info(
                     "DL msg=%d file=%s code=%d elapsed=%.2fs speed=%s",
@@ -1243,6 +1286,14 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 ul_progress.transferred_bytes = 0
                 ul_progress.total_bytes = state["upload_total"]
                 ul_progress.start_time = time.monotonic()
+                # ponytail: on_progress bridges pipeline callbacks → Telegram edits
+                async def _ul_on_progress(tp: TransferProgress) -> None:
+                    state["upload_phase"] = "uploading"
+                    state["upload_file_name"] = tp.filename
+                    state["upload_current"] = tp.transferred_bytes
+                    state["upload_total"] = tp.total_bytes
+                    state["upload_speed_bps"] = tp.speed_bps
+                    await _refresh_bot_progress(state, force=True)
                 sent = None
                 t_ul_start = time.monotonic()
                 for attempt in range(4):
@@ -1254,6 +1305,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                             attributes=orig_attrs if orig_attrs else None,
                             mime_type=orig_mime,
                             supports_streaming=orig_streaming,
+                            on_progress=_ul_on_progress,
                         )
                         break
                     except (FloodWaitError, SlowModeWaitError) as e:
@@ -1282,6 +1334,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 state["upload_phase"] = "idle"
                 state["upload_current"] = 0
                 state["upload_total"] = 0
+                await _refresh_bot_progress(state, force=True)
 
                 log.info(
                     "UL msg=%d file=%s elapsed=%.2fs speed=%s sent=%s",

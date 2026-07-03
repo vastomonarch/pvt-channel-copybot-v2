@@ -331,8 +331,13 @@ async def upload_with_progress(
     attributes: list | None = None,
     mime_type: str | None = None,
     supports_streaming: bool = False,
+    on_progress: Callable[[TransferProgress], Any] | None = None,
 ) -> Any:
     """Upload a file using Telethon with progress tracking.
+
+    Args:
+        on_progress: Optional async callback invoked on each significant
+            progress tick.  Used by the caller to edit a Telegram message.
 
     Returns the sent message on success, None on failure.
     """
@@ -350,29 +355,34 @@ async def upload_with_progress(
 
     last_bytes = 0
     last_time = time.monotonic()
+    _notify_handle = [None]  # mutable container for closure
 
     async def _progress_cb(current: int, total: int) -> None:
         nonlocal last_bytes, last_time
         now = time.monotonic()
         dt = now - last_time
 
-        if dt > 0.5 and current > last_bytes:
-            # Calculate speed using simple moving average
+        # Always update the dataclass so callers see fresh numbers
+        progress.transferred_bytes = current
+        progress.total_bytes = total
+
+        if dt > 0.3 and current > last_bytes:
             speed = (current - last_bytes) / dt
-            progress.speed_bps = speed * 0.3 + progress.speed_bps * 0.7  # smoothing
-            progress.transferred_bytes = current
-            progress.total_bytes = total
-
-            # Calculate ETA
+            progress.speed_bps = speed * 0.3 + progress.speed_bps * 0.7
             remaining = total - current
-            if progress.speed_bps > 0:
-                progress.eta_seconds = remaining / progress.speed_bps
-            else:
-                progress.eta_seconds = 0
-
+            progress.eta_seconds = remaining / progress.speed_bps if progress.speed_bps > 0 else 0
             progress.elapsed_seconds = now - progress.start_time
             last_bytes = current
             last_time = now
+            # Throttled notification to caller (every ~2 s or 2% change)
+            if on_progress and progress.should_update:
+                progress.mark_updated()
+                try:
+                    result = on_progress(progress)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    log.debug("on_progress callback error: %s", exc)
 
     try:
         result = await client.send_file(
@@ -391,6 +401,15 @@ async def upload_with_progress(
         progress.elapsed_seconds = time.monotonic() - progress.start_time
         if progress.elapsed_seconds > 0:
             progress.speed_bps = file_size / progress.elapsed_seconds
+        progress.phase = "done"
+        # Final notification
+        if on_progress:
+            try:
+                result2 = on_progress(progress)
+                if asyncio.iscoroutine(result2):
+                    await result2
+            except Exception:
+                pass
 
         return result
 
@@ -412,8 +431,13 @@ async def download_with_progress(
     progress: TransferProgress,
     src_entity: Any = None,
     retries: int = 2,
+    on_progress: Callable[[TransferProgress], Any] | None = None,
 ) -> tuple[str | None, int, float]:
     """Download media from a message with progress tracking.
+
+    Args:
+        on_progress: Optional async callback invoked on each significant
+            progress tick.  Used by the caller to edit a Telegram message.
 
     Returns (path, size_bytes, elapsed_seconds).
     """
@@ -455,20 +479,29 @@ async def download_with_progress(
         now = time.monotonic()
         dt = now - last_time
 
+        # Always update the dataclass
+        progress.transferred_bytes = current
+        if total > 0:
+            progress.total_bytes = total
+
         if dt > 0.3 and current > last_bytes:
             speed = (current - last_bytes) / dt
             progress.speed_bps = speed * 0.3 + progress.speed_bps * 0.7
-            progress.transferred_bytes = current
-            if total > 0:
-                progress.total_bytes = total
-
             remaining = total - current
             if progress.speed_bps > 0:
                 progress.eta_seconds = remaining / progress.speed_bps
-
             progress.elapsed_seconds = now - progress.start_time
             last_bytes = current
             last_time = now
+            # Throttled notification to caller
+            if on_progress and progress.should_update:
+                progress.mark_updated()
+                try:
+                    result = on_progress(progress)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    log.debug("on_progress callback error: %s", exc)
 
     fresh = msg
     last_err = None

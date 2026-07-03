@@ -1,10 +1,10 @@
 <div align="center">
 
-# 📋 Private Channel Copy Bot
+# 📋 Private Channel Copy Bot v2
 
 **A Telethon-based userbot for copying messages from private Telegram channels**
 
-*Strip forwarded-from tags • Live progress tracking • Bulk delete*
+*Strip forwarded-from tags • Live file-level progress • Bulk delete*
 
 ---
 
@@ -25,25 +25,61 @@
 - **Message Copying** — Copy messages between channels without "Forwarded from" tags
 - **Download Pipeline** — Download → Upload → Verify with resumable checkpoints
 - **Bulk Delete** — Delete message ranges with a single command
-- **Live Progress** — Real-time progress bars with speed, ETA, and spinners
+- **Live Progress** — Real-time file-level progress bars with speed, ETA, and spinners during both download AND upload phases
 - **Bot Integration** — Separate bot client for progress updates (keeps user account clean)
 - **Error Recovery** — Automatic retry on FloodWait, resumable after crashes
 - **Private Channels** — Works with private channels where forwarding is disabled
+- **Throttled Edits** — Progress messages update at most every 2s or on 2% change (Telegram-safe)
 
 ## 📸 Preview
 
+### During Download
 ```
-╭──────────────────────────────────────╮
-│ ⠹ ⬇ Downloading                     
-│ 📄 video_edit.mov                    
-├──────────────────────────────────────┤
-│ ████████████▉▉▉          67.3%       
-│                                      
-│ 📦  1.25 GB / 2.00 GB               
-│ ⚡  12.7 MB/s                        
-│ ⏳  ETA      1m 05s                  
-│ 🕒  Elapsed  2m 30s                  
-╰──────────────────────────────────────╯
+╭──────────────────────────────────╮
+│ ⠹ ⬇ Downloading                 
+│ 📄 video_edit.mov                
+├──────────────────────────────────┤
+│ ████████████▉▉▉      67.3%      
+│                                  
+│ 📦  1.25 GB / 2.00 GB           
+│ ⚡  12.7 MB/s                    
+│ ⏳  ETA      1m 05s              
+│ 🕒  Elapsed  2m 30s              
+├──────────────────────────────────┤
+│ DL: 45 · UL: 40 · skip: 3 · err: 2
+╰──────────────────────────────────╯
+```
+
+### During Upload
+```
+╭──────────────────────────────────╮
+│ ⠼ ⬆ Uploading                   
+│ 📄 video_edit.mov                
+├──────────────────────────────────┤
+│ █████████████████▋    83.2%      
+│                                  
+│ 📦  1.66 GB / 2.00 GB           
+│ ⚡  9.4 MB/s                     
+│ ⏳  ETA      36 s                
+│ 🕒  Elapsed  4m 12s              
+├──────────────────────────────────┤
+│ DL: 45 · UL: 42 · skip: 3 · err: 2
+╰──────────────────────────────────╯
+```
+
+### Completed
+```
+╭──────────────────────────────────╮
+│ ✅ Downloaded                    
+│ job [a1b2c3d4]                   
+├──────────────────────────────────┤
+│ ████████████████████             
+│                                  
+│ 📦  100 messages                 
+│ DL: 95 · UL: 90                 
+│ skip: 3 · err: 2                
+│ 🕒  Completed in 60m 00s         
+╰──────────────────────────────────╯
 ```
 
 ## 🚀 Quick Start
@@ -143,7 +179,15 @@ All commands use `.` (dot) prefix. The bot's `/start` uses slash (standard Teleg
 
 ```
 pvt_channel_copybot_v2/
-├── bot.py                  # Main bot logic and handlers
+├── bot.py                  # Main bot logic, handlers, and progress routing
+├── pipeline.py             # Download/upload pipeline with aria2c + Telethon
+├── progress_ui/            # Modular progress UI components
+│   ├── __init__.py         # Public API exports
+│   ├── constants.py        # Box-drawing chars, spinner frames, icons
+│   ├── formatter.py        # Human-readable size/speed/time formatting
+│   ├── progress.py         # Unicode progress bar renderer
+│   ├── renderer.py         # Dashboard box layout renderers
+│   └── spinner.py          # Terminal spinner animation
 ├── trigger_pvtcopydl.py    # Headless trigger for testing
 ├── requirements.txt        # Python dependencies
 ├── .env.example           # Environment template
@@ -164,17 +208,24 @@ pvt_channel_copybot_v2/
 
 2. **Message Pipeline** — For `.pvtcopydl`:
    - Fetch messages from source
-   - Download media to temp directory
-   - Upload to destination
+   - Download media to temp directory (with live progress via `on_progress` callback)
+   - Upload to destination (with live progress via `on_progress` callback)
    - Verify upload integrity
    - Clean up temp files
    - Checkpoint after each message (resumable)
 
-3. **Progress Tracking** — Live updates via the bot client:
+3. **Progress Tracking** — Live file-level updates via the bot client:
    - Unicode progress bar with spinner
-   - Download/upload speed
+   - Real-time bytes transferred / total bytes
+   - Download/upload speed (smoothed rolling average)
    - ETA calculation
-   - Refresh and cancel buttons
+   - Throttled edits (max every 2s or 2% change)
+   - Refresh and cancel inline buttons
+
+4. **Architecture** — Modular design:
+   - `pipeline.py` — Transfer logic with `on_progress` callbacks
+   - `progress_ui/` — Reusable rendering components
+   - `bot.py` — Orchestration and Telegram integration
 
 ## ⚠️ Limitations
 

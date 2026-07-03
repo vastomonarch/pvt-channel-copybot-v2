@@ -74,30 +74,51 @@ def render_copy_progress(
     eta: float = 0.0,
     elapsed: float = 0.0,
     filename: str = "",
+    file_current: int = 0,
+    file_total: int = 0,
     width: int = DEFAULT_BOX_WIDTH,
 ) -> str:
     """Render the copy/download progress dashboard.
 
+    When file_current/file_total are provided (>0), shows file-level
+    progress (bytes transferred) instead of message-count progress.
+
     Returns HTML-formatted string with <pre> wrapping.
     """
     spin = spinner.next()
-    arrow = ICON_UPLOAD if mode == "upload" else ICON_DOWNLOAD
-    action = "Uploading" if mode == "upload" else "Downloading"
 
-    # Progress calculation
-    done_count = max(0, current_msg - 1)  # messages processed so far
-    pct = (done_count / max(1, total)) * 100.0
+    # Determine mode display
+    if mode == "uploading":
+        arrow = ICON_UPLOAD
+        action = "Uploading"
+    elif mode == "downloading":
+        arrow = ICON_DOWNLOAD
+        action = "Downloading"
+    else:
+        arrow = ICON_DOWNLOAD
+        action = "Downloading"
+
+    # File-level progress (active transfer)
+    use_file_progress = file_total > 0
+    if use_file_progress:
+        pct = min(100.0, (file_current / max(1, file_total)) * 100.0)
+        size_line = f"{ICON_SIZE}  {format_size(file_current)} / {format_size(file_total)}"
+    else:
+        # Message-count progress (between files)
+        done_count = max(0, current_msg - 1)
+        pct = (done_count / max(1, total)) * 100.0
+        size_line = f"{ICON_SIZE}  msg {current_msg} / {total}"
+
     bar = progress_bar(pct, width=20)
     pct_str = format_percent(pct)
 
     # Header
-    header = f"{spin} {arrow} {action}  [{job_key[:8]}]"
+    header = f"{spin} {arrow} {action}"
 
-    # File info line (if downloading/uploading a file)
+    # File info line
     file_line = f"{ICON_FILE} {filename}" if filename else f"{ICON_FILE} msg {current_msg}"
 
     # Stats
-    size_line = f"{ICON_SIZE}  msg {current_msg} / {total}"
     speed_line = f"{ICON_SPEED}  {format_speed(speed)}" if speed > 0 else f"{ICON_SPEED}  —"
     eta_line = f"{ICON_ETA}  ETA      {format_time(eta)}" if eta > 0 else f"{ICON_ETA}  ETA      —"
     elapsed_line = f"{ICON_ELAPSED}  Elapsed  {format_time(elapsed)}"
