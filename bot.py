@@ -979,15 +979,19 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
 
         # Determine nosound_video for videos
         nosound_video = None
+        force_file = False
         if orig_mime and orig_mime.startswith("video/"):
-            nosound_video = True
+            if orig_streaming:
+                nosound_video = True
+            else:
+                force_file = True  # ponytail: retain file type, not streamable
 
         # Construct media with original attributes
         fm = tg_types.InputMediaUploadedDocument(
             file=file_handle,
             mime_type=orig_mime,
             attributes=orig_attrs if orig_attrs else None,
-            force_file=False,
+            force_file=force_file,
             nosound_video=nosound_video,
         )
 
@@ -995,7 +999,7 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
         r = await client(tg_functions.messages.UploadMediaRequest(entity, media=fm))
         fm = tg_utils.get_input_media(
             r.document,
-            supports_streaming=orig_streaming
+            supports_streaming=orig_streaming if orig_streaming else None
         )
 
         caption = msg.message or ""
@@ -1305,6 +1309,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                             attributes=orig_attrs if orig_attrs else None,
                             mime_type=orig_mime,
                             supports_streaming=orig_streaming,
+                            force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
                             on_progress=_ul_on_progress,
                         )
                         break
