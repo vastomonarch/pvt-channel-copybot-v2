@@ -703,6 +703,8 @@ async def _refresh_bot_progress(state: dict, *, force: bool = False) -> None:
         await asyncio.sleep(getattr(e, "seconds", 0) + 1)
     except MessageNotModifiedError:
         pass  # Telegram says the text is identical; harmless
+    except MessageIdInvalidError:
+        state.pop("progress_msg_id", None)  # ponytail: message gone, will resend next tick
     except Exception as e:  # message-not-modified and the like; ignore
         log.debug("progress edit failed: %s", type(e).__name__)
 
