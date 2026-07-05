@@ -458,16 +458,17 @@ def _extract_document_attrs(msg):
     """Extract relevant document attributes from a message for re-upload.
 
     Returns:
-        (attributes_list, mime_type, supports_streaming)
+        (attributes_list, mime_type, supports_streaming, thumb)
     """
     attrs = []
     mime_type = None
     supports_streaming = False
+    thumb = None
 
     media = getattr(msg, "media", None)
     doc = getattr(media, "document", None) if media else None
     if doc is None:
-        return attrs, mime_type, supports_streaming
+        return attrs, mime_type, supports_streaming, thumb
 
     mime_type = getattr(doc, "mime_type", None)
 
@@ -484,7 +485,15 @@ def _extract_document_attrs(msg):
         elif isinstance(attr, DocumentAttributeAnimated):
             attrs.append(attr)
 
-    return attrs, mime_type, supports_streaming
+    # ponytail: grab original thumbnail for re-upload
+    video_thumbs = getattr(doc, "video_thumbs", None) or []
+    thumbs = getattr(doc, "thumbs", None) or []
+    all_thumbs = video_thumbs + thumbs
+    if all_thumbs:
+        # pick the largest thumbnail
+        thumb = max(all_thumbs, key=lambda t: getattr(t, "size", 0) or 0)
+
+    return attrs, mime_type, supports_streaming, thumb
 
 
 def _make_album_upload_progress_callback(state: dict, file_index: int, total_files: int):
@@ -956,7 +965,7 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
     media_list = []
 
     for idx, (msg, path) in enumerate(siblings_with_paths):
-        orig_attrs, orig_mime, orig_streaming = _extract_document_attrs(msg)
+        orig_attrs, orig_mime, orig_streaming, orig_thumb = _extract_document_attrs(msg)
 
         # Set upload phase for progress tracking
         if state:
@@ -977,6 +986,17 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
         cb = _make_album_upload_progress_callback(state, idx, len(siblings_with_paths)) if state else None
         file_handle = await client.upload_file(path, progress_callback=cb)
 
+        # Download original thumbnail for re-upload
+        thumb_handle = None
+        thumb_tmp = None
+        if orig_thumb:
+            try:
+                thumb_tmp = f"_thumb_{idx}_{os.getpid()}.jpg"
+                await client.download_media(orig_thumb, file=thumb_tmp)
+                thumb_handle = await client.upload_file(thumb_tmp)
+            except Exception:
+                thumb_handle = None  # ponytail: skip thumb on failure
+
         # Determine nosound_video for videos
         nosound_video = None
         force_file = False
@@ -989,11 +1009,19 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
         # Construct media with original attributes
         fm = tg_types.InputMediaUploadedDocument(
             file=file_handle,
+            thumb=thumb_handle,
             mime_type=orig_mime,
             attributes=orig_attrs if orig_attrs else None,
             force_file=force_file,
             nosound_video=nosound_video,
         )
+
+        # Cleanup thumb temp file
+        if thumb_tmp and os.path.exists(thumb_tmp):
+            try:
+                os.remove(thumb_tmp)
+            except Exception:
+                pass
 
         # Upload as media to get a proper reference
         r = await client(tg_functions.messages.UploadMediaRequest(entity, media=fm))
@@ -1213,7 +1241,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
 
             elif ctype == "media":
                 # Extract original document attributes BEFORE upload
-                orig_attrs, orig_mime, orig_streaming = _extract_document_attrs(cur)
+                orig_attrs, orig_mime, orig_streaming, orig_thumb = _extract_document_attrs(cur)
                 file_name = ""
                 for a in orig_attrs:
                     if isinstance(a, DocumentAttributeFilename):
@@ -1283,6 +1311,15 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 state["upload_current"] = 0
                 state["upload_total"] = os.path.getsize(path) if os.path.exists(path) else 0
 
+                # Download original thumbnail for re-upload
+                thumb_path = None
+                if orig_thumb:
+                    try:
+                        thumb_path = f"_thumb_{msg_id}_{os.getpid()}.jpg"
+                        await client.download_media(orig_thumb, file=thumb_path)
+                    except Exception:
+                        thumb_path = None  # ponytail: skip thumb on failure
+
                 # Use pipeline upload with progress tracking
                 ul_progress = state.setdefault("_ul_progress", TransferProgress())
                 ul_progress.phase = "uploading"
@@ -1310,6 +1347,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                             mime_type=orig_mime,
                             supports_streaming=orig_streaming,
                             force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
+                            thumb=thumb_path,
                             on_progress=_ul_on_progress,
                         )
                         break
@@ -1334,6 +1372,12 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                             break
                         path = path2
                         continue
+                # Cleanup thumb temp file
+                if thumb_path and os.path.exists(thumb_path):
+                    try:
+                        os.remove(thumb_path)
+                    except Exception:
+                        pass
                 t_ul_end = time.monotonic()
                 ul_elapsed = t_ul_end - t_ul_start
                 state["upload_phase"] = "idle"

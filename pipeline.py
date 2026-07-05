@@ -332,6 +332,7 @@ async def upload_with_progress(
     mime_type: str | None = None,
     supports_streaming: bool = False,
     force_document: bool = False,
+    thumb: str | None = None,
     on_progress: Callable[[TransferProgress], Any] | None = None,
 ) -> Any:
     """Upload a file using Telethon with progress tracking.
@@ -395,6 +396,7 @@ async def upload_with_progress(
             mime_type=mime_type,
             supports_streaming=supports_streaming,
             force_document=force_document,
+            thumb=thumb,
             progress_callback=_progress_cb,
         )
 
