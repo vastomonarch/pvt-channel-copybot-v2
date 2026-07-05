@@ -1465,6 +1465,8 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
 # ===========================================================================
 @client.on(events.NewMessage(pattern=r"\.pvtcopydlcancel(?:\s+(\S+))?"))
 async def handle_pvtcopydlcancel(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     m = event.pattern_match
     key = m.group(1) if m and m.lastindex else None
     if not key:
@@ -1489,6 +1491,8 @@ async def handle_pvtcopydlcancel(event):
 # ===========================================================================
 @client.on(events.NewMessage(pattern=r"\.pvtcopydl\s+(\S+)\s+(\S+)"))
 async def handle_pvtcopydl(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     start_link = event.pattern_match.group(1)
     end_link = event.pattern_match.group(2)
 
@@ -1678,6 +1682,8 @@ async def handle_pvtcopydl(event):
 # ===========================================================================
 @client.on(events.NewMessage(pattern=r"\.logout"))
 async def handle_logout(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     await event.respond("logging out; deleting session file.")
     session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 f"{SESSION_NAME}.session")
@@ -1695,6 +1701,8 @@ async def handle_logout(event):
 
 @client.on(events.NewMessage(pattern=r"\.adest\s+(-?\d+)"))
 async def handle_add_destination(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     raw_id = event.pattern_match.group(1)
     full_id = f"-100{raw_id}"
     cfg = _load_config()
@@ -1710,6 +1718,8 @@ async def handle_add_destination(event):
 
 @client.on(events.NewMessage(pattern=r"\.showdest"))
 async def handle_show_destination(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     cfg = _load_config()
     if not cfg["destinations"]:
         await event.respond("no destinations configured. use .adest <id> first.")
@@ -1737,6 +1747,8 @@ async def handle_select_callback(event):
 
 @client.on(events.NewMessage(pattern=r"\.pvtcopy\s+(\S+)\s+(\S+)"))
 async def handle_pvtcopy(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     start_link = event.pattern_match.group(1)
     end_link = event.pattern_match.group(2)
     start = parse_message_link(start_link)
@@ -1883,6 +1895,8 @@ _DEL_BATCH_SIZE = 100
 
 @client.on(events.NewMessage(pattern=r"\.del\s+(\S+)\s+(\S+)"))
 async def handle_del(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
     """Bulk-delete messages in an inclusive range.
 
     Usage:  .del <start_link> <end_link>
@@ -2093,6 +2107,8 @@ async def handle_del(event):
 
 @client.on(events.NewMessage(pattern=r"\.help"))
 async def handle_help(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: only owner gets help
     bot_friendly = f"@{BOT_USERNAME}" if BOT_USERNAME else "your Bot"
     await event.respond(
         "private channel copy bot — commands:\n\n"
