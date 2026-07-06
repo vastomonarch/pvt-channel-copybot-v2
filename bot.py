@@ -370,44 +370,7 @@ def _job_key(src_id, start_id: int, end_id: int) -> str:
     return hashlib.sha1(s).hexdigest()[:12]
 
 
-def _checkpoint_path(job_key: str) -> pathlib.Path:
-    return pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / f".pvtcopydl_{job_key}.json"
-
-
-def _save_checkpoint(job_key: str, state: dict) -> None:
-    # Exclude non-serializable objects (Spinner, etc.)
-    payload = {k: v for k, v in state.items() if not k.startswith("_")}
-    payload["updated_at"] = time.time()
-    p = _checkpoint_path(job_key)
-    tmp = str(p) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, str(p))
-
-
-def _save_state(state: dict) -> None:
-    """Convenience wrapper that uses state[\"job_key\"]."""
-    _save_checkpoint(state["job_key"], state)
-
-
-def _load_checkpoint(job_key: str):
-    p = _checkpoint_path(job_key)
-    if not p.exists():
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _clear_checkpoint(job_key: str) -> None:
-    try:
-        os.remove(_checkpoint_path(job_key))
-    except FileNotFoundError:
-        pass
-
-
+# ponytail: resume feature removed per user request
 def _safe_unlink(path) -> None:
     if not path:
         return
@@ -551,7 +514,7 @@ def _format_status(state: dict) -> str:
         f"  retries    : {state.get('retries', 0)}\n"
         f"  flood_waits: {state.get('flood_waits', 0)}\n"
         f"  eta        : {state.get('eta', ETA_NA)}\n"
-        f"  checkpoint : .pvtcopydl_{state.get('job_key', '?')}.json"
+        ""
     )
 
 
@@ -1064,6 +1027,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
     job_key = state["job_key"]
     start_id = state["start_msg_id"]
     end_id = state["end_msg_id"]
+    total = end_id - start_id + 1  # ponytail: fix NameError - total was undefined
     downloaded = state.get("downloaded", 0)
     uploaded = state.get("uploaded", 0)
     last_downloads = state.get("per_item_times", [])
@@ -1090,7 +1054,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
             if cur is None:
                 state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 continue
 
             # ----- ALBUM branch -----
@@ -1115,7 +1079,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 if not sibs_in_order:
                     state["skipped"] = (state.get("skipped", 0) + 1) + max(0, len(siblings) - 1)
                     state["current_msg_id"] = siblings[-1].id + 1
-                    _save_state(state)
+                    pass  # ponytail: resume removed
                     continue
                 downloaded += len(sibs_in_order)
                 state["downloaded"] = downloaded
@@ -1161,10 +1125,10 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     for _, p in sibs_in_order:
                         _safe_unlink(p)
                     state["current_msg_id"] = siblings[-1].id + 1
-                    _save_state(state)
+                    pass  # ponytail: resume removed
                     sent_after_attempt = True
                 state["current_msg_id"] = max(state.get("current_msg_id", msg_id), siblings[-1].id + 1)
-                _save_state(state)
+                pass  # ponytail: resume removed
                 loop_end = time.monotonic()
                 last_downloads = (last_downloads + [loop_end - loop_start])[-recent_max:]
                 state["per_item_times"] = last_downloads
@@ -1180,7 +1144,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
             if ctype == "service":
                 state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
                 continue
 
@@ -1207,7 +1171,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     errors += 1
                     state["errors"] = errors
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
 
             elif ctype == "poll":
@@ -1218,7 +1182,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 else:
                     state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
 
             elif ctype == "contact":
@@ -1228,7 +1192,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 else:
                     state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
 
             elif ctype == "location":
@@ -1238,7 +1202,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 else:
                     state["skipped"] = (state.get("skipped", 0)) + 1
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
 
             elif ctype == "media":
@@ -1282,14 +1246,14 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     state["skipped"] = (state.get("skipped", 0) + 1)
                     state["current_msg_id"] = msg_id + 1
                     state["upload_phase"] = "idle"
-                    _save_state(state)
+                    pass  # ponytail: resume removed
                     sent_after_attempt = True
                     continue
                 if code == -2:
                     state["skipped"] = (state.get("skipped", 0) + 1)
                     state["current_msg_id"] = msg_id + 1
                     state["upload_phase"] = "idle"
-                    _save_state(state)
+                    pass  # ponytail: resume removed
                     sent_after_attempt = True
                     continue
                 downloaded += 1
@@ -1302,7 +1266,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     state["errors"] = errors
                     state["current_msg_id"] = msg_id + 1
                     state["upload_phase"] = "idle"
-                    _save_state(state)
+                    pass  # ponytail: resume removed
                     sent_after_attempt = True
                     continue
 
@@ -1404,14 +1368,14 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     errors += 1
                     state["errors"] = errors
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_point = sent_after_attempt = True
 
             else:
                 log.warning("unhandled classify=%s msg=%d", ctype, msg_id)
                 state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
-                _save_state(state)
+                pass  # ponytail: resume removed
                 sent_after_attempt = True
 
             loop_end = time.monotonic()
@@ -1435,7 +1399,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
         except (MessageIdInvalidError, MessageDeleteForbiddenError, MediaEmptyError):
             state["skipped"] = (state.get("skipped", 0) + 1)
             state["current_msg_id"] = msg_id + 1
-            _save_state(state)
+            pass  # ponytail: resume removed
         except ChatAdminRequiredError as e:
             log.error("pvtcopydl hard-stop: destination requires admin")
             try:
@@ -1458,7 +1422,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 await status_msg.edit(fail_text)
             except Exception:
                 pass
-            _save_state(state)
+            pass  # ponytail: resume removed
             return
         except (ConnectionError, asyncio.TimeoutError):
             retries += 1
@@ -1466,14 +1430,14 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
             await asyncio.sleep(5)
             continue
         except asyncio.CancelledError:
-            _save_state(state)
+            pass  # ponytail: resume removed
             raise
         except Exception as e:
             log.exception("unhandled error pvtcopydl msg=%d", msg_id)
             errors += 1
             state["errors"] = errors
             state["current_msg_id"] = msg_id + 1
-            _save_state(state)
+            pass  # ponytail: resume removed
 
         # ---- progress routing --------------------------------------------
         processed += 1
@@ -1534,7 +1498,7 @@ async def handle_pvtcopydlcancel(event):
         await event.respond(f"no running job with key `{key}` (already done or never started).")
         return
     task.cancel()
-    await event.respond(f"cancelling job `{key}` - checkpoint preserved.")
+    await event.respond(f"cancelling job `{key}`.")
 
 
 # ===========================================================================
@@ -1579,9 +1543,7 @@ async def handle_pvtcopydl(event):
     job_key = _job_key(src_identifier, start_msg_id, end_msg_id)
     total = end_msg_id - start_msg_id + 1
 
-    prior = _load_checkpoint(job_key)
-    if prior is None:
-        state = {
+    state = {
             "job_key": job_key,
             "src": str(src_identifier),
             "dst": str(dest_channel_id),
@@ -1610,20 +1572,6 @@ async def handle_pvtcopydl(event):
             "started_at": time.time(),
             "_spinner": Spinner(),
         }
-    else:
-        state = prior
-        state.setdefault("speed_window", [])
-        state.setdefault("download_speed_bps", 0.0)
-        state.setdefault("bytes_downloaded_total", 0)
-        state.setdefault("upload_phase", "idle")
-        state.setdefault("upload_file_name", "")
-        state.setdefault("upload_current", 0)
-        state.setdefault("upload_total", 0)
-        state.setdefault("upload_speed_bps", 0.0)
-        state.setdefault("upload_bytes_total", 0)
-        state.setdefault("upload_speed_window", [])
-        state.setdefault("_spinner", Spinner())
-        state["total"] = total
 
     # Send initial progress message with inline buttons in user's chat
     spinner = state["_spinner"]
@@ -1689,7 +1637,7 @@ async def handle_pvtcopydl(event):
         log.exception("pvtcopydl CRASH key=%s err=%s", job_key, e)
         try:
             await status_msg.edit(
-                f"❌ pvtcopydl crashed: {e}\ncheckpoint saved — re-issue to resume."
+                f"❌ pvtcopydl crashed: {e}"
             )
         except Exception:
             pass
@@ -1703,7 +1651,7 @@ async def handle_pvtcopydl(event):
         elapsed = time.time() - state.get("started_at", time.time())
         if tail_id > end_msg_id:
             if state.get("uploaded", 0) > 0:
-                _clear_checkpoint(job_key)
+                
                 log.info(
                     "pvtcopydl DONE key=%s uploaded=%d errors=%d",
                     job_key, state.get("uploaded", 0), state.get("errors", 0),
@@ -1721,7 +1669,7 @@ async def handle_pvtcopydl(event):
                 )
                 await status_msg.edit(final_text)
             else:
-                log.warning("pvtcopydl DONE uploaded=0 - checkpoint kept")
+                log.warning("pvtcopydl DONE uploaded=0")
         else:
             log.warning("pvtcopydl STOP key=%s tail=%d end=%d", job_key, tail_id, end_id)
     except Exception as e:
@@ -2170,7 +2118,7 @@ async def handle_help(event):
         "    download → upload → verify → delete pipeline.\n"
         "    for channels where forwarding is disabled.\n"
         f"    live progress (bar / eta / speed / refresh) appears in chat with {bot_friendly}.\n"
-        "    resumable after crashes; ETA derived from rolling per-item times.\n\n"
+        "    ETA derived from rolling per-item times.\n\n"
         ".pvtcopydlcancel <job_key>\n"
         "    cancel a .pvtcopydl job.\n\n"
         ".del <start_link> <end_link>\n"
