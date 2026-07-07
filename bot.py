@@ -1052,6 +1052,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
             fetched_list = fetched if isinstance(fetched, list) else [fetched]
             cur = next((m for m in fetched_list if m is not None and m.id == msg_id), None)
             if cur is None:
+                log.info("MSG NOT FOUND msg=%d - skipping", msg_id)
                 state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
                 pass  # ponytail: resume removed
@@ -1376,10 +1377,46 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     state["uploaded"] = uploaded
                     _safe_unlink(path)
                 else:
-                    retries += 1
-                    state["retries"] = retries
-                    errors += 1
-                    state["errors"] = errors
+                    # Upload failed - retry up to 2 more times
+                    upload_ok = False
+                    for _ul_retry in range(2):
+                        log.warning("UL retry %d for msg=%d", _ul_retry + 1, msg_id)
+                        try:
+                            sent = await upload_with_progress(
+                                client, dst_entity, path, ul_progress,
+                                caption=cur.message or None,
+                                formatting_entities=cur.entities,
+                                attributes=orig_attrs if orig_attrs else None,
+                                mime_type=orig_mime,
+                                supports_streaming=orig_streaming,
+                                force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
+                                thumb=thumb_path,
+                                on_progress=_ul_on_progress,
+                            )
+                            if sent and await _verify_uploaded(dst_entity, sent, cur):
+                                upload_ok = True
+                                uploaded += 1
+                                state["uploaded"] = uploaded
+                                _safe_unlink(path)
+                                break
+                        except (FloodWaitError, SlowModeWaitError) as e:
+                            await _send_wait_sleep(e)
+                        except Exception as e:
+                            log.warning("UL retry failed msg=%d: %s", msg_id, e)
+                    if not upload_ok:
+                        errors += 1
+                        state["errors"] = errors
+                        _safe_unlink(path)
+                        # Stop job and report error
+                        try:
+                            await status_msg.edit(
+                                f"❌ Upload failed for msg={msg_id} ({file_name or '?'})\n"
+                                f"Downloaded: {_human_bytes(code)}\n"
+                                f"Job stopped. Fix the issue and restart."
+                            )
+                        except Exception:
+                            pass
+                        return  # stop the job
                 state["current_msg_id"] = msg_id + 1
                 pass  # ponytail: resume removed
                 sent_after_point = sent_after_attempt = True
