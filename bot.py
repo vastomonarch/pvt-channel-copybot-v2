@@ -1286,9 +1286,18 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 if orig_thumb:
                     try:
                         thumb_path = f"_thumb_{msg_id}_{os.getpid()}.jpg"
-                        await client.download_media(orig_thumb, file=thumb_path)
-                    except Exception:
-                        thumb_path = None  # ponytail: skip thumb on failure
+                        _thumb_result = await client.download_media(orig_thumb, file=thumb_path)
+                        if not _thumb_result or not os.path.exists(thumb_path):
+                            log.warning("thumb download returned %s, file missing: %s", _thumb_result, thumb_path)
+                            thumb_path = None
+                    except Exception as e:
+                        log.warning("thumb download failed msg=%d: %s", msg_id, e)
+                        thumb_path = None
+
+                # Ensure thumb file exists before upload
+                if thumb_path and not os.path.exists(thumb_path):
+                    log.warning("thumb file missing before upload, skipping: %s", thumb_path)
+                    thumb_path = None
 
                 # Use pipeline upload with progress tracking
                 ul_progress = state.setdefault("_ul_progress", TransferProgress())
