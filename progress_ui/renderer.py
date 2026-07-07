@@ -76,6 +76,7 @@ def render_copy_progress(
     filename: str = "",
     file_current: int = 0,
     file_total: int = 0,
+    start_msg: int = 0,
     width: int = DEFAULT_BOX_WIDTH,
 ) -> str:
     """Render the copy/download progress dashboard.
@@ -105,7 +106,7 @@ def render_copy_progress(
         size_line = f"{ICON_SIZE}  {format_size(file_current)} / {format_size(file_total)}"
     else:
         # Message-count progress (between files)
-        done_count = max(0, current_msg - 1)
+        done_count = max(0, current_msg - start_msg) if start_msg else 0
         pct = (done_count / max(1, total)) * 100.0
         size_line = f"{ICON_SIZE}  msg {current_msg} / {total}"
 

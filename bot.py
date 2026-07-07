@@ -560,6 +560,7 @@ def _format_bot_status(state: dict) -> str:
             filename=filename,
             file_current=file_cur,
             file_total=file_total,
+            start_msg=start,
         )
 
     # Otherwise show message-level progress
@@ -572,6 +573,7 @@ def _format_bot_status(state: dict) -> str:
         mode="download",
         job_key=state.get("job_key", "?"),
         current_msg=cur,
+        start_msg=start,
         total=total_msgs,
         downloaded=state.get("downloaded", 0),
         uploaded=state.get("uploaded", 0),
@@ -1468,6 +1470,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     eta=0.0,
                     elapsed=elapsed,
                     filename="",
+                    start_msg=start_id,
                 )
                 await status_msg.edit(fail_text)
             except Exception:
@@ -1511,6 +1514,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     eta=_parse_eta_to_seconds(state.get("eta", ETA_NA)),
                     elapsed=elapsed,
                     filename=state.get("upload_file_name", ""),
+                    start_msg=start_id,
                 )
                 log.debug("editing progress msg=%d chat=%s", status_msg.id, state.get("progress_chat_id"))
                 await status_msg.edit(new_text, buttons=_job_inline_buttons(job_key))
@@ -1640,6 +1644,7 @@ async def handle_pvtcopydl(event):
         eta=0.0,
         elapsed=0.0,
         filename="",
+        start_msg=start_msg_id,
     )
     status_msg = await event.respond(
         initial_text,
@@ -1678,6 +1683,7 @@ async def handle_pvtcopydl(event):
                 eta=0.0,
                 elapsed=elapsed,
                 filename="",
+                start_msg=start_msg_id,
             )
             await status_msg.edit(cancel_text)
         except Exception:
