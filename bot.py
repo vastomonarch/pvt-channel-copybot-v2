@@ -1233,14 +1233,17 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     state["upload_total"] = tp.total_bytes
                     state["download_speed_bps"] = tp.speed_bps
                     await _refresh_bot_progress(state, force=True)
+                # Get expected size for logging
+                _exp_size = _media_size_bytes(cur)
                 path, code, elapsed = await download_with_progress(
                     client, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
                     on_progress=_dl_on_progress,
                 )
                 log.info(
-                    "DL msg=%d file=%s code=%d elapsed=%.2fs speed=%s",
-                    msg_id, file_name or "?", code, elapsed,
+                    "DL msg=%d file=%s code=%d exp=%d elapsed=%.2fs speed=%s path=%s",
+                    msg_id, file_name or "?", code, _exp_size, elapsed,
                     _human_speed(code / max(elapsed, 0.001)) if code > 0 and elapsed > 0 else "—",
+                    path or "None",
                 )
                 if code == -1:
                     state["skipped"] = (state.get("skipped", 0) + 1)
@@ -1262,6 +1265,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 if code > 0 and elapsed > 0:
                     _update_speed(state, code, elapsed)
                 if not path:
+                    log.warning("DL FAILED msg=%d code=%d exp=%d err=%s", msg_id, code, _exp_size, dl_progress.error or "unknown")
                     errors += 1
                     state["errors"] = errors
                     state["current_msg_id"] = msg_id + 1
