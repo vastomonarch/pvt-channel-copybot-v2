@@ -72,8 +72,14 @@ def _enable_wal_journal(path: str) -> None:
         print(f"[trigger] WAL setup failed for {path}: {type(e).__name__}: {e}")
 
 
+# Enable WAL journal on all session files
 for _sess_name in ("copybot_session.session", "copybot_bot_session.session"):
     _enable_wal_journal(os.path.join(ROOT, _sess_name))
+_sessions_dir = os.path.join(ROOT, "sessions")
+if os.path.isdir(_sessions_dir):
+    for _sess_file in os.listdir(_sessions_dir):
+        if _sess_file.endswith(".session"):
+            _enable_wal_journal(os.path.join(_sessions_dir, _sess_file))
 
 # Importing bot.py triggers its module-level wiring (clients, globals, env
 # loading, config).  We just import, we don't yet connect.
@@ -114,6 +120,12 @@ class FakeStatusMsg:
         pass
 
 
+class FakeMessage:
+    """Mimics a Telethon Message for the FakeEvent."""
+    def __init__(self, text: str):
+        self.text = text
+
+
 class FakeEvent:
     """Mimics a Telethon NewMessage event for the .pvtcopydl pattern."""
 
@@ -122,6 +134,7 @@ class FakeEvent:
         if not m:
             raise RuntimeError(f"command does not match .pvtcopydl pattern: {text!r}")
         self.pattern_match = m
+        self.message = FakeMessage(text)
 
     async def respond(self, msg, **kwargs) -> FakeStatusMsg:
         return FakeStatusMsg(msg)

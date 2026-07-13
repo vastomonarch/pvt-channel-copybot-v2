@@ -38,6 +38,7 @@ from telethon.errors import (
     SlowModeWaitError,
     FileReferenceExpiredError,
     MediaEmptyError,
+    SessionPasswordNeededError,
 )
 from telethon.tl import functions as tg_functions
 from telethon.tl import types as tg_types
@@ -204,10 +205,34 @@ def _human_eta(seconds: float) -> str:
 
 
 # ===========================================================================
-# Clients
+# Clients & Session Management
 # ===========================================================================
-SESSION_NAME = "copybot_session"
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+from session_manager import SessionManager, mask_phone
+
+# ─ Session directory ────────────────────────────────────────────────
+SESSIONS_DIR = pathlib.Path(__file__).resolve().parent / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Migrate existing root session file to sessions/ on first run so both the
+# module-level `client` and the session_manager share the same directory.
+_old_root_sess = pathlib.Path(__file__).resolve().parent / "copybot_session.session"
+_new_default_sess = SESSIONS_DIR / "default.session"
+if _old_root_sess.exists() and not _new_default_sess.exists():
+    import shutil
+    shutil.copy2(_old_root_sess, _new_default_sess)
+    for _sfx in ("-shm", "-wal"):
+        _src = pathlib.Path(str(_old_root_sess) + _sfx)
+        if _src.exists():
+            shutil.copy2(_src, SESSIONS_DIR / f"default{_sfx}")
+    log.info("migrated copybot_session.session → sessions/default.session")
+
+SESSION_NAME = str(SESSIONS_DIR / "default")  # absolute path without .session
+session_manager = SessionManager(API_ID, API_HASH, sessions_dir=SESSIONS_DIR)
+
+# Primary user client (backward compatible).
+# This is shared with session_manager so that the module-level `client`
+# and session_manager.get_client("default") return the same instance.
+client = session_manager.create_or_get_client("default")
 
 # Second Telethon client acts as a Telegram *bot* driven by the BOT_TOKEN.
 # Both run in the same asyncio loop so they share in-memory state directly.
@@ -294,6 +319,44 @@ def _save_config(cfg: dict) -> None:
 def get_selected_destination() -> int:
     cfg = _load_config()
     return int(cfg["selected"])
+
+
+# ===========================================================================
+# Session flag parser (-s <name>)
+# ===========================================================================
+def parse_session_flag(text: str) -> tuple[str | None, str]:
+    """Parse optional '-s <session>' from command text.
+
+    Returns (session_name_or_None, cleaned_text_without_flag).
+    """
+    m = re.search(r"-s\s+(\S+)", text)
+    if m:
+        session_name = m.group(1)
+        cleaned = text[: m.start()] + text[m.end() :]
+        return session_name, cleaned.strip()
+    return None, text
+
+
+def get_client_for_command(event_client: TelegramClient, session_name: str | None = None) -> TelegramClient:
+    """Get the appropriate client for a command.
+
+    Priority:
+    1. If session_name is provided via `-s <name>`, use that session's client.
+    2. Otherwise, use the session_manager's active/default session.
+    3. Fall back to the event's client (backward compat).
+    """
+    if session_name:
+        is_valid, err = session_manager.validate_session(session_name)
+        if not is_valid:
+            raise ValueError(err)
+        return session_manager.get_client(session_name)
+    active = session_manager.get_active_name()
+    if active:
+        try:
+            return session_manager.get_client(active)
+        except ValueError:
+            pass
+    return event_client
 
 
 # ===========================================================================
@@ -759,7 +822,7 @@ def _media_size_bytes(msg) -> int:
 # ---------------------------------------------------------------------------
 # Single-shot download / verify
 # ---------------------------------------------------------------------------
-async def _redownload_media(msg, src_entity=None, retries: int = 2):
+async def _redownload_media(msg, src_entity=None, retries: int = 2, tc: TelegramClient | None = None):
     """Download msg.media to JOB_DIR.
 
     Returns:
@@ -768,6 +831,8 @@ async def _redownload_media(msg, src_entity=None, retries: int = 2):
         (None, -2, 0.0) if media is empty / revoked
         (None,  0, 0.0) on hard failure
     """
+    if tc is None:
+        tc = client
     size = _media_size_bytes(msg)
     if size and size > MAX_SINGLE_FILE_BYTES:
         log.info(
@@ -781,7 +846,7 @@ async def _redownload_media(msg, src_entity=None, retries: int = 2):
     for attempt in range(retries + 1):
         try:
             t0 = time.monotonic()
-            path = await client.download_media(fresh, file=str(JOB_DIR) + "/")
+            path = await tc.download_media(fresh, file=str(JOB_DIR) + "/")
             elapsed = time.monotonic() - t0
             if path:
                 actual = os.path.getsize(path) if os.path.exists(path) else 0
@@ -801,7 +866,7 @@ async def _redownload_media(msg, src_entity=None, retries: int = 2):
         except FileReferenceExpiredError:
             try:
                 lookup = src_entity if src_entity is not None else fresh.peer_id
-                fresh_list = await client.get_messages(lookup, ids=fresh.id)
+                fresh_list = await tc.get_messages(lookup, ids=fresh.id)
                 fresh = fresh_list[0] if isinstance(fresh_list, list) else fresh_list
                 if fresh is None:
                     return None, 0, 0.0
@@ -825,14 +890,16 @@ async def _redownload_media(msg, src_entity=None, retries: int = 2):
     return None, 0, 0.0
 
 
-async def _verify_uploaded(dst_entity, sent_msg, original_msg) -> bool:
+async def _verify_uploaded(dst_entity, sent_msg, original_msg, tc: TelegramClient | None = None) -> bool:
+    if tc is None:
+        tc = client
     if sent_msg is None:
         return False
     sent_id = getattr(sent_msg, "id", None)
     if sent_id is None:
         return False
     try:
-        refetched_list = await client.get_messages(dst_entity, ids=sent_id)
+        refetched_list = await tc.get_messages(dst_entity, ids=sent_id)
         refetched = refetched_list[0] if isinstance(refetched_list, list) else refetched_list
     except Exception as e:
         log.warning("verify re-fetch failed: %s", e)
@@ -856,15 +923,19 @@ async def _verify_uploaded(dst_entity, sent_msg, original_msg) -> bool:
 # ---------------------------------------------------------------------------
 # Re-upload helpers  (unchanged behaviour)
 # ---------------------------------------------------------------------------
-async def _reupload_text(msg, dst_entity):
-    return await client.send_message(
+async def _reupload_text(msg, dst_entity, tc: TelegramClient | None = None):
+    if tc is None:
+        tc = client
+    return await tc.send_message(
         entity=dst_entity,
         message=msg.message or "",
         formatting_entities=msg.entities,
     )
 
 
-async def _reupload_poll(msg, dst_entity):
+async def _reupload_poll(msg, dst_entity, tc: TelegramClient | None = None):
+    if tc is None:
+        tc = client
     poll = msg.poll
     if not poll:
         return None
@@ -883,10 +954,10 @@ async def _reupload_poll(msg, dst_entity):
         parts.append(f"  {i}. {a_text or '(empty option)'}")
     if getattr(poll, "closed", False):
         parts.append("_(Poll closed)_")
-    return await client.send_message(dst_entity, message="\n".join(parts))
+    return await tc.send_message(dst_entity, message="\n".join(parts))
 
 
-async def _reupload_contact(msg, dst_entity):
+async def _reupload_contact(msg, dst_entity, tc: TelegramClient | None = None):
     c = msg.contact
     if not c:
         return None
@@ -901,10 +972,12 @@ async def _reupload_contact(msg, dst_entity):
         lines.append(f"Phone: `{c.phone_number}`")
     if getattr(c, "user_id", None):
         lines.append(f"UserID: `{c.user_id}`")
-    return await client.send_message(dst_entity, message="\n".join(lines))
+    if tc is None:
+        tc = client
+    return await tc.send_message(dst_entity, message="\n".join(lines))
 
 
-async def _reupload_location(msg, dst_entity):
+async def _reupload_location(msg, dst_entity, tc: TelegramClient | None = None):
     g = msg.geo
     if not g:
         return None
@@ -920,15 +993,19 @@ async def _reupload_location(msg, dst_entity):
     if getattr(g, "period", None):
         live_note = "\n_(was a live location; TTL stripped - Telegram API limitation)_"
     text = f"📍 **Location**{live_note}\n`{lat:.6f}, {lon:.6f}`\n{maps_url}"
-    return await client.send_message(dst_entity, message=text)
+    if tc is None:
+        tc = client
+    return await tc.send_message(dst_entity, message=text)
 
 
-async def _reupload_album(siblings_with_paths, dst_entity, state=None):
+async def _reupload_album(siblings_with_paths, dst_entity, state=None, tc: TelegramClient | None = None):
     """Upload album items preserving original document attributes."""
     if not siblings_with_paths:
         return None
 
-    entity = await client.get_input_entity(dst_entity)
+    if tc is None:
+        tc = client
+    entity = await tc.get_input_entity(dst_entity)
     media_list = []
 
     for idx, (msg, path) in enumerate(siblings_with_paths):
@@ -951,7 +1028,7 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
 
         # Upload the file with per-file progress callback
         cb = _make_album_upload_progress_callback(state, idx, len(siblings_with_paths)) if state else None
-        file_handle = await client.upload_file(path, progress_callback=cb)
+        file_handle = await tc.upload_file(path, progress_callback=cb)
 
         # Download original thumbnail for re-upload
         thumb_handle = None
@@ -959,8 +1036,8 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
         if orig_thumb:
             try:
                 thumb_tmp = f"_thumb_{idx}_{os.getpid()}.jpg"
-                await client.download_media(orig_thumb, file=thumb_tmp)
-                thumb_handle = await client.upload_file(thumb_tmp)
+                await tc.download_media(orig_thumb, file=thumb_tmp)
+                thumb_handle = await tc.upload_file(thumb_tmp)
             except Exception:
                 thumb_handle = None  # ponytail: skip thumb on failure
 
@@ -991,7 +1068,7 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
                 pass
 
         # Upload as media to get a proper reference
-        r = await client(tg_functions.messages.UploadMediaRequest(entity, media=fm))
+        r = await tc(tg_functions.messages.UploadMediaRequest(entity, media=fm))
         fm = tg_utils.get_input_media(
             r.document,
             supports_streaming=orig_streaming if orig_streaming else None
@@ -1011,9 +1088,9 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None):
         entity,
         multi_media=media_list
     )
-    result = await client(request)
+    result = await tc(request)
     random_ids = [m.random_id for m in media_list]
-    return client._get_response_message(random_ids, result, dst_entity)
+    return tc._get_response_message(random_ids, result, dst_entity)
 
 
 # ===========================================================================
@@ -1025,7 +1102,10 @@ async def _send_wait_sleep(e):
     await asyncio.sleep(wait)
 
 
-async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
+async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: TelegramClient | None = None):
+    # Use provided client or fall back to global client
+    if tc is None:
+        tc = client
     job_key = state["job_key"]
     start_id = state["start_msg_id"]
     end_id = state["end_msg_id"]
@@ -1050,7 +1130,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
             window_lo = max(start_id, msg_id - ALBUM_WINDOW)
             window_hi = min(end_id, msg_id + ALBUM_WINDOW)
             ids = list(range(window_lo, window_hi + 1))
-            fetched = await client.get_messages(src_entity, ids=ids)
+            fetched = await tc.get_messages(src_entity, ids=ids)
             fetched_list = fetched if isinstance(fetched, list) else [fetched]
             cur = next((m for m in fetched_list if m is not None and m.id == msg_id), None)
             if cur is None:
@@ -1072,7 +1152,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     if _media_size_bytes(s) and _media_size_bytes(s) > MAX_SINGLE_FILE_BYTES:
                         too_big = True
                         continue
-                    p, code, _ = await _redownload_media(s, src_entity=src_entity)
+                    p, code, _ = await _redownload_media(s, src_entity=src_entity, tc=tc)
                     if code == -1:
                         too_big = True
                         continue
@@ -1089,7 +1169,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 sent = None
                 for attempt in range(4):
                     try:
-                        sent = await _reupload_album(sibs_in_order, dst_entity, state=state)
+                        sent = await _reupload_album(sibs_in_order, dst_entity, state=state, tc=tc)
                         break
                     except (FloodWaitError, SlowModeWaitError) as e:
                         flood_waits += 1
@@ -1102,7 +1182,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                         await asyncio.sleep(5)
                         continue
                 if sent is not None:
-                    head_ok = await _verify_uploaded(dst_entity, sent, sibs_in_order[0][0])
+                    head_ok = await _verify_uploaded(dst_entity, sent, sibs_in_order[0][0], tc=tc)
                     if not head_ok:
                         retries += 1
                         state["retries"] = retries
@@ -1110,7 +1190,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     elif len(sibs_in_order) > 1:
                         tail_ids = [sent.id + i for i in range(1, len(sibs_in_order))]
                         try:
-                            tail_list = await client.get_messages(dst_entity, ids=tail_ids)
+                            tail_list = await tc.get_messages(dst_entity, ids=tail_ids)
                             tail = tail_list if isinstance(tail_list, list) else [tail_list]
                             missing = sum(1 for t in tail if t is None or not getattr(t, "media", None))
                             if missing:
@@ -1155,7 +1235,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 sent = None
                 for attempt in range(4):
                     try:
-                        sent = await _reupload_text(cur, dst_entity)
+                        sent = await _reupload_text(cur, dst_entity, tc=tc)
                         break
                     except (FloodWaitError, SlowModeWaitError) as e:
                         flood_waits += 1
@@ -1167,7 +1247,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                         state["retries"] = retries
                         await asyncio.sleep(5)
                         continue
-                if sent and await _verify_uploaded(dst_entity, sent, cur):
+                if sent and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
                 else:
@@ -1178,7 +1258,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 sent_after_attempt = True
 
             elif ctype == "poll":
-                sent = await _reupload_poll(cur, dst_entity)
+                sent = await _reupload_poll(cur, dst_entity, tc=tc)
                 if sent:
                     uploaded += 1
                     state["uploaded"] = uploaded
@@ -1189,7 +1269,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 sent_after_attempt = True
 
             elif ctype == "contact":
-                if await _reupload_contact(cur, dst_entity):
+                if await _reupload_contact(cur, dst_entity, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
                 else:
@@ -1199,7 +1279,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 sent_after_attempt = True
 
             elif ctype == "location":
-                if await _reupload_location(cur, dst_entity):
+                if await _reupload_location(cur, dst_entity, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
                 else:
@@ -1239,7 +1319,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 # Get expected size for logging
                 _exp_size = _media_size_bytes(cur)
                 path, code, elapsed = await download_with_progress(
-                    client, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
+                    tc, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
                     on_progress=_dl_on_progress,
                 )
                 log.info(
@@ -1289,7 +1369,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 if orig_thumb:
                     try:
                         thumb_path = f"_thumb_{msg_id}_{os.getpid()}.jpg"
-                        _thumb_result = await client.download_media(orig_thumb, file=thumb_path)
+                        _thumb_result = await tc.download_media(orig_thumb, file=thumb_path)
                         if not _thumb_result or not os.path.exists(thumb_path):
                             log.warning("thumb download returned %s, file missing: %s", _thumb_result, thumb_path)
                             thumb_path = None
@@ -1322,7 +1402,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                 for attempt in range(4):
                     try:
                         sent = await upload_with_progress(
-                            client, dst_entity, path, ul_progress,
+                            tc, dst_entity, path, ul_progress,
                             caption=cur.message or None,
                             formatting_entities=cur.entities,
                             attributes=orig_attrs if orig_attrs else None,
@@ -1347,7 +1427,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                         retries += 1
                         state["retries"] = retries
                         cleanup_file(path)
-                        path2, code2, _ = await _redownload_media(cur, src_entity=src_entity)
+                        path2, code2, _ = await _redownload_media(cur, src_entity=src_entity, tc=tc)
                         if code2 == -1 or not path2:
                             errors += 1
                             state["errors"] = errors
@@ -1374,7 +1454,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                     "ok" if sent else "FAILED",
                 )
 
-                if sent is not None and await _verify_uploaded(dst_entity, sent, cur):
+                if sent is not None and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
                     _safe_unlink(path)
@@ -1385,7 +1465,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                         log.warning("UL retry %d for msg=%d", _ul_retry + 1, msg_id)
                         try:
                             sent = await upload_with_progress(
-                                client, dst_entity, path, ul_progress,
+                                tc, dst_entity, path, ul_progress,
                                 caption=cur.message or None,
                                 formatting_entities=cur.entities,
                                 attributes=orig_attrs if orig_attrs else None,
@@ -1395,7 +1475,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg):
                                 thumb=thumb_path,
                                 on_progress=_ul_on_progress,
                             )
-                            if sent and await _verify_uploaded(dst_entity, sent, cur):
+                            if sent and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
                                 upload_ok = True
                                 uploaded += 1
                                 state["uploaded"] = uploaded
@@ -1562,8 +1642,21 @@ async def handle_pvtcopydlcancel(event):
 async def handle_pvtcopydl(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
-    start_link = event.pattern_match.group(1)
-    end_link = event.pattern_match.group(2)
+
+    # Parse optional -s flag
+    session_name, cleaned_text = parse_session_flag(event.message.text)
+    try:
+        tc = get_client_for_command(client, session_name)
+    except ValueError as e:
+        await event.respond(str(e))
+        return
+
+    m = re.search(r"\.pvtcopydl\s+(\S+)\s+(\S+)", cleaned_text)
+    if not m:
+        await event.respond("invalid format.")
+        return
+    start_link = m.group(1)
+    end_link = m.group(2)
 
     start = parse_message_link(start_link)
     end = parse_message_link(end_link)
@@ -1588,8 +1681,8 @@ async def handle_pvtcopydl(event):
         return
 
     try:
-        src_entity = await client.get_entity(src_identifier)
-        dst_entity = await client.get_entity(dest_channel_id)
+        src_entity = await tc.get_entity(src_identifier)
+        dst_entity = await tc.get_entity(dest_channel_id)
     except (ChannelPrivateError, ValueError) as e:
         await event.respond(f"cannot resolve channel: {e}")
         return
@@ -1599,6 +1692,7 @@ async def handle_pvtcopydl(event):
 
     state = {
             "job_key": job_key,
+            "session": session_name or session_manager.get_active_name(),
             "src": str(src_identifier),
             "dst": str(dest_channel_id),
             "start_msg_id": start_msg_id,
@@ -1664,7 +1758,7 @@ async def handle_pvtcopydl(event):
     )
 
     try:
-        await _loop_pvtcopydl(state, src_entity, dst_entity, status_msg)
+        await _loop_pvtcopydl(state, src_entity, dst_entity, status_msg, tc)
     except asyncio.CancelledError:
         log.info("pvtcopydl CANCEL key=%s", job_key)
         try:
@@ -1739,19 +1833,45 @@ async def handle_pvtcopydl(event):
 async def handle_logout(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
-    await event.respond("logging out; deleting session file.")
-    session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                f"{SESSION_NAME}.session")
-    await client.disconnect()
-    if os.path.exists(session_file):
-        os.remove(session_file)
-        log.info("session deleted: %s", session_file)
-    if bot_client is not None:
+
+    # Parse optional -s flag
+    session_name, _ = parse_session_flag(event.message.text)
+
+    if session_name:
+        # Log out specific session
+        if not session_manager.has_session(session_name):
+            await event.respond(f"session '{session_name}' not found.")
+            return
+
+        # Check if any jobs are running on this session
+        for job_key, state in ACTIVE_DL_STATES.items():
+            if state.get("session") == session_name:
+                await event.respond(
+                    f"cannot logout session '{session_name}': job '{job_key}' is running.\n"
+                    "cancel the job first with .pvtcopydlcancel"
+                )
+                return
+
         try:
-            await bot_client.disconnect()
-        except Exception:
-            pass
-    os._exit(0)
+            await session_manager.remove_session(session_name)
+            await event.respond(f"session '{session_name}' logged out and removed.")
+        except Exception as e:
+            await event.respond(f"failed to logout: {e}")
+    else:
+        # Log out default session (original behavior)
+        await event.respond("logging out; deleting session file.")
+        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    f"{SESSION_NAME}.session")
+        await client.disconnect()
+        if os.path.exists(session_file):
+            os.remove(session_file)
+            log.info("session deleted: %s", session_file)
+        if bot_client is not None:
+            try:
+                await bot_client.disconnect()
+            except Exception:
+                pass
+        os._exit(0)
 
 
 @client.on(events.NewMessage(pattern=r"\.adest\s+(-?\d+)"))
@@ -1804,8 +1924,21 @@ async def handle_select_callback(event):
 async def handle_pvtcopy(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
-    start_link = event.pattern_match.group(1)
-    end_link = event.pattern_match.group(2)
+
+    # Parse optional -s flag
+    session_name, cleaned_text = parse_session_flag(event.message.text)
+    try:
+        tc = get_client_for_command(client, session_name)
+    except ValueError as e:
+        await event.respond(str(e))
+        return
+
+    m = re.search(r"\.pvtcopy\s+(\S+)\s+(\S+)", cleaned_text)
+    if not m:
+        await event.respond("invalid format.")
+        return
+    start_link = m.group(1)
+    end_link = m.group(2)
     start = parse_message_link(start_link)
     end = parse_message_link(end_link)
     if start is None or end is None:
@@ -1824,8 +1957,8 @@ async def handle_pvtcopy(event):
         f"copying {msg_count} messages\nsrc: {src_identifier} → dst: {dest_channel_id}"
     )
     try:
-        src_entity = await client.get_entity(src_identifier)
-        dst_entity = await client.get_entity(dest_channel_id)
+        src_entity = await tc.get_entity(src_identifier)
+        dst_entity = await tc.get_entity(dest_channel_id)
     except (ChannelPrivateError, ValueError) as e:
         await status_msg.edit(f"cannot access channel: {e}")
         return
@@ -1859,7 +1992,7 @@ async def handle_pvtcopy(event):
 
     for msg_id in range(start_msg_id, end_msg_id + 1):
         try:
-            messages = await client.get_messages(src_entity, ids=msg_id)
+            messages = await tc.get_messages(src_entity, ids=msg_id)
             if not messages:
                 skipped += 1
                 continue
@@ -1868,14 +2001,14 @@ async def handle_pvtcopy(event):
                 skipped += 1
                 continue
             if msg.media:
-                await client.send_file(
+                await tc.send_file(
                     entity=dst_entity,
                     file=msg.media,
                     caption=msg.message or "",
                     formatting_entities=msg.entities,
                 )
             elif msg.message:
-                await client.send_message(
+                await tc.send_message(
                     entity=dst_entity,
                     message=msg.message,
                     formatting_entities=msg.entities,
@@ -1957,8 +2090,20 @@ async def handle_del(event):
     Usage:  .del <start_link> <end_link>
     Both links must belong to the same chat/channel.
     """
-    start_link = event.pattern_match.group(1)
-    end_link = event.pattern_match.group(2)
+    # Parse optional -s flag
+    session_name, cleaned_text = parse_session_flag(event.message.text)
+    try:
+        tc = get_client_for_command(client, session_name)
+    except ValueError as e:
+        await event.respond(str(e))
+        return
+
+    m = re.search(r"\.del\s+(\S+)\s+(\S+)", cleaned_text)
+    if not m:
+        await event.respond("invalid format.")
+        return
+    start_link = m.group(1)
+    end_link = m.group(2)
 
     start = parse_message_link(start_link)
     end = parse_message_link(end_link)
@@ -1988,7 +2133,7 @@ async def handle_del(event):
 
     # Resolve the entity and verify access.
     try:
-        entity = await client.get_entity(src_start)
+        entity = await tc.get_entity(src_start)
     except ChannelPrivateError:
         await event.respond(
             "\u274c Cannot access this chat. "
@@ -2008,10 +2153,10 @@ async def handle_del(event):
     # batch; if we lack rights Telegram will reply with ChatAdminRequiredError
     # or MessageDeleteForbiddenError.
     try:
-        probe = await client.get_messages(entity, ids=start_msg_id)
+        probe = await tc.get_messages(entity, ids=start_msg_id)
         if probe is None:
             # Message might not exist; try the end of the range.
-            probe = await client.get_messages(entity, ids=end_msg_id)
+            probe = await tc.get_messages(entity, ids=end_msg_id)
     except ChatAdminRequiredError:
         await event.respond(
             "\u274c You don\u2019t have permission to interact with this chat."
@@ -2055,7 +2200,7 @@ async def handle_del(event):
         current_id = batch[-1]
 
         try:
-            result = await client.delete_messages(entity, batch)
+            result = await tc.delete_messages(entity, batch)
             if isinstance(result, list):
                 deleted += len(result)
                 skipped += len(batch) - len(result)
@@ -2069,7 +2214,7 @@ async def handle_del(event):
             log.warning(".del flood-wait %ds", wait_s)
             await asyncio.sleep(wait_s)
             try:
-                result = await client.delete_messages(entity, batch)
+                result = await tc.delete_messages(entity, batch)
                 if isinstance(result, list):
                     deleted += len(result)
                     skipped += len(batch) - len(result)
@@ -2160,6 +2305,239 @@ async def handle_del(event):
     )
 
 
+# ===========================================================================
+# .session  --  Multi-session management
+# ===========================================================================
+# Pending login state for .session add flow
+# Keyed by sender_id so bot_client and user_client share the flow state.
+_pending_logins: dict[int, dict] = {}  # sender_id -> {name, client, step, phone}
+
+
+@client.on(events.NewMessage(pattern=r"\.session\s+add\s+(\S+)"))
+async def handle_session_add(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+    name = event.pattern_match.group(1)
+    user_id = event.sender_id
+
+    if session_manager.has_session(name):
+        await event.respond(f"session '{name}' already exists.")
+        return
+
+    try:
+        new_client = await session_manager.add_session(name)
+    except ValueError as e:
+        await event.respond(str(e))
+        return
+
+    # Start the login flow
+    try:
+        await new_client.connect()
+    except Exception as e:
+        await event.respond(f"failed to connect: {e}")
+        return
+
+    if await new_client.is_user_authorized():
+        # Already authorized (migrated session)
+        me = await new_client.get_me()
+        session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
+        if not session_manager.get_active_name():
+            session_manager.set_active(name)
+        await event.respond(f"session '{name}' authorized as {me.first_name} (id={me.id}).")
+        return
+
+    # Store state for the conversation flow
+    _pending_logins[user_id] = {
+        "name": name,
+        "client": new_client,
+        "step": "phone",
+    }
+    await event.respond(
+        f"session '{name}' created.\n"
+        "please send your phone number (with country code, e.g. +1234567890):\n"
+        "send .session cancel to abort."
+    )
+
+
+@client.on(events.NewMessage(pattern=r"\.session\s+list"))
+async def handle_session_list(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+
+    sessions = session_manager.list_sessions()
+    if not sessions:
+        await event.respond("no sessions configured.")
+        return
+
+    lines = ["configured sessions:\n"]
+    for s in sessions:
+        status = "✅ authorized" if s["authorized"] else "⏳ pending"
+        active = " • 🔵 active" if s["active"] else ""
+        phone_display = mask_phone(s["phone"]) if s["phone"] not in ("pending", "unknown") else "(login in progress)" if s["phone"] == "pending" else "(unknown)"
+        lines.append(f"  • {s['name']}: {phone_display} • {status}{active}")
+
+    await event.respond("\n".join(lines))
+
+
+@client.on(events.NewMessage(pattern=r"\.session\s+use\s+(\S+)"))
+async def handle_session_use(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+    name = event.pattern_match.group(1)
+
+    is_valid, err = session_manager.validate_session(name)
+    if not is_valid:
+        await event.respond(err)
+        return
+
+    session_manager.set_active(name)
+    await event.respond(f"active session set to '{name}'.")
+
+
+@client.on(events.NewMessage(pattern=r"\.session\s+current"))
+async def handle_session_current(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+
+    active = session_manager.get_active_name()
+    if not active:
+        await event.respond("no active session.")
+        return
+
+    is_valid, _ = session_manager.validate_session(active)
+    status = "authorized" if is_valid else "not authorized"
+    await event.respond(f"active session: {active} ({status})")
+
+
+@client.on(events.NewMessage(pattern=r"\.session\s+remove\s+(\S+)"))
+async def handle_session_remove(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+    name = event.pattern_match.group(1)
+
+    if not session_manager.has_session(name):
+        await event.respond(f"session '{name}' not found.")
+        return
+
+    # Check if any jobs are running on this session
+    for job_key, state in ACTIVE_DL_STATES.items():
+        if state.get("session") == name:
+            await event.respond(
+                f"cannot remove session '{name}': job '{job_key}' is running on it.\n"
+                "cancel the job first with .pvtcopydlcancel"
+            )
+            return
+
+    try:
+        await session_manager.remove_session(name)
+        await event.respond(f"session '{name}' removed.")
+    except ValueError as e:
+        await event.respond(str(e))
+
+
+# Handle pending login conversation flow
+@client.on(events.NewMessage(func=lambda e: e.sender_id in _pending_logins))
+async def handle_session_login_flow(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+
+    user_id = event.sender_id
+    state = _pending_logins.get(user_id)
+    if not state:
+        return
+
+    text = event.message.text.strip()
+    name = state["name"]
+    telethon_client = state["client"]
+    step = state["step"]
+
+    if text.lower() == ".session cancel":
+        del _pending_logins[user_id]
+        try:
+            await telethon_client.disconnect()
+        except Exception:
+            pass
+        await event.respond(f"session '{name}' login cancelled.")
+        return
+
+    if step == "phone":
+        # User sent phone number
+        phone = text
+        if not phone.startswith("+"):
+            await event.respond("phone must start with + and include country code.")
+            return
+
+        try:
+            await telethon_client.send_code_request(phone)
+            state["step"] = "code"
+            state["phone"] = phone
+            await event.respond("code sent. please send the login code:")
+        except Exception as e:
+            del _pending_logins[user_id]
+            try:
+                await telethon_client.disconnect()
+            except Exception:
+                pass
+            await event.respond(f"failed to send code: {e}")
+
+    elif step == "code":
+        # User sent login code – strip spaces (Telegram may send "5 4 3 7 1")
+        code = text.replace(" ", "")
+        phone = state.get("phone", "")
+
+        try:
+            await telethon_client.sign_in(phone, code)
+            me = await telethon_client.get_me()
+            session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
+
+            if not session_manager.get_active_name():
+                session_manager.set_active(name)
+
+            del _pending_logins[user_id]
+            await event.respond(
+                f"session '{name}' authorized as {me.first_name} (id={me.id}).\n"
+                f"use .session use {name} to make it the default."
+            )
+        except SessionPasswordNeededError:
+            # 2FA enabled – ask for cloud password
+            state["step"] = "password"
+            await event.respond(
+                "this account has 2FA enabled.\n"
+                "please send your cloud password (not the login code):"
+            )
+        except Exception as e:
+            del _pending_logins[user_id]
+            try:
+                await telethon_client.disconnect()
+            except Exception:
+                pass
+            await event.respond(f"login failed: {e}")
+
+    elif step == "password":
+        # User sent cloud password (2FA)
+        password = text
+        try:
+            await telethon_client.sign_in(password=password)
+            me = await telethon_client.get_me()
+            session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
+
+            if not session_manager.get_active_name():
+                session_manager.set_active(name)
+
+            del _pending_logins[user_id]
+            await event.respond(
+                f"session '{name}' authorized as {me.first_name} (id={me.id}).\n"
+                f"use .session use {name} to make it the default."
+            )
+        except Exception as e:
+            del _pending_logins[user_id]
+            try:
+                await telethon_client.disconnect()
+            except Exception:
+                pass
+            await event.respond(f"login failed: {e}")
+
+
 @client.on(events.NewMessage(pattern=r"\.help"))
 async def handle_help(event):
     if ME_ID and event.sender_id != ME_ID:
@@ -2183,6 +2561,13 @@ async def handle_help(event):
         ".adest <channel_id>\n"
         "    .showdest  — add or browse destination channels.\n\n"
         ".logout — disconnect.\n\n"
+        ".session add <name>    — login a new Telegram account.\n"
+        ".session list          — show all configured sessions.\n"
+        ".session use <name>    — set the default session.\n"
+        ".session current       — show the active session.\n"
+        ".session remove <name> — remove a session.\n\n"
+        "optional: use -s <session> with any command to specify session.\n"
+        "    example: .pvtcopy -s backup <start> <end>\n\n"
         ".help — this message."
     )
 
@@ -2235,6 +2620,18 @@ def _register_bot_handlers() -> None:
     async def _bot_cancel(event):
         job_key = event.pattern_match.group(1).decode()
         await _cancel_for(event, job_key)
+
+    # ── Session management via bot ──────────────────────────────────
+    # Re-use the same module-level handlers. We register them here so
+    # the owner can add/list/remove sessions through the bot as well.
+    # The ME_ID check inside each handler ensures only the owner can
+    # run these commands.
+    bot_client.add_event_handler(handle_session_add, events.NewMessage(pattern=r"\.session\s+add\s+(\S+)"))
+    bot_client.add_event_handler(handle_session_list, events.NewMessage(pattern=r"\.session\s+list"))
+    bot_client.add_event_handler(handle_session_use, events.NewMessage(pattern=r"\.session\s+use\s+(\S+)"))
+    bot_client.add_event_handler(handle_session_current, events.NewMessage(pattern=r"\.session\s+current"))
+    bot_client.add_event_handler(handle_session_remove, events.NewMessage(pattern=r"\.session\s+remove\s+(\S+)"))
+    bot_client.add_event_handler(handle_session_login_flow, events.NewMessage(func=lambda e: e.sender_id in _pending_logins))
 
 
 async def _refresh_for(event, job_key: str | None, *, force: bool) -> None:
@@ -2346,16 +2743,36 @@ async def main():
     # All globals used in this body are declared up-front so the implicit-
     # global pass doesn't trip the "used prior to global declaration"
     # SyntaxError later in this function.
-    global ME_ID, BOT_USERNAME, BOT_ID, bot_client
+    global ME_ID, BOT_USERNAME, BOT_ID, bot_client, client
 
-    log.info("connecting userbot...")
+    # ── Load all session files ──────────────────────────────────────
+    loaded = await session_manager.load_sessions()
+    log.info("loaded sessions: %s", loaded)
+
+    # Connect the primary session (backward compatible)
+    log.info("connecting primary userbot...")
     await client.start()
     me = await client.get_me()
     ME_ID = me.id
+
+    # Register this session in the session_manager if not already present
+    active_name = session_manager.get_active_name()
+    if not active_name:
+        session_manager.set_active("default")
+        active_name = "default"
+    session_manager.update_session_info(active_name, phone=getattr(me, "phone", None), authorized=True)
+
     log.info(
         "userbot OK: %s (id=%d)  active-dst=%s",
         me.first_name, me.id, get_selected_destination(),
     )
+
+    # ── Connect additional sessions ─────────────────────────────────
+    results = await session_manager.connect_all()
+    for name, ok in results.items():
+        if name != active_name:
+            status = "OK" if ok else "FAILED"
+            log.info("session %s: %s", name, status)
 
     if bot_client is not None:
         try:
