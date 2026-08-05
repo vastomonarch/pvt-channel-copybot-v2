@@ -354,7 +354,7 @@ ACTIVE_DL_STATES: dict[str, dict] = {}
 JOB_DIR = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "_pvtcopydl_tmp"
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SINGLE_FILE_BYTES = 1000 * 1024 * 1024  # 1 GB — Telegram drops connections on uploads >1GB
+MAX_SINGLE_FILE_BYTES = 1900 * 1024 * 1024  # ~1.9 GB — Telegram's hard cap is 2 GB; leave headroom for metadata/overhead
 
 # User-account status edits are now reserved for milestones only (start,
 # crash, finish).  Live updates flow through the Bot.

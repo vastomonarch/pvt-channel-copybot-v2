@@ -44,7 +44,7 @@ log = logging.getLogger("copybot.pipeline")
 JOB_DIR = Path(__file__).resolve().parent / "_downloads"
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SINGLE_FILE_BYTES = 1000 * 1024 * 1024  # 1 GB — Telegram drops connections on uploads >1GB
+MAX_SINGLE_FILE_BYTES = 1900 * 1024 * 1024  # ~1.9 GB — Telegram's hard cap is 2 GB; leave headroom for metadata/overhead
 ARIA2_RPC_SECRET = None  # Set if aria2c is configured with auth
 ARIA2_JSONRPC = "http://localhost:6800/jsonrpc"
 

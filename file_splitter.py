@@ -1,17 +1,52 @@
-"""Split files that exceed Telegram's 2GB upload limit.
+"""Split files that exceed Telegram's upload limit.
 
-For video files: ffmpeg segment muxer (each part is playable).
-For archives / other files: binary split (recombine with `cat`).
+Strategy (in priority order):
+  1. Archive files (.7z, .rar, .zip, .tar*, .gz, .bz2, .xz, .zst)
+     → Repack as 7z volumes.  Each volume is a self-contained archive
+     that can be extracted independently.
+  2. Video files → ffmpeg segment muxer (each segment is playable).
+  3. Everything else → binary split with ``coreutils split``.
+
+All outputs are verified: no part exceeds *max_size*.
 """
 
 import os
 import subprocess
 import logging
+import shutil
+import tempfile
 
 log = logging.getLogger("copybot.splitter")
 
-VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm',
-              '.m4v', '.mpg', '.mpeg', '.3gp', '.ts'}
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+    ".m4v", ".mpg", ".mpeg", ".3gp", ".ts",
+}
+
+ARCHIVE_EXTS = {
+    ".7z", ".rar", ".zip",
+    ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2",
+    ".tar.xz", ".txz", ".tar.zst",
+    ".gz", ".bz2", ".xz", ".zst",
+}
+
+# Formats that 7z can extract but that aren't self-extracting volumes.
+_EXTRACTABLE = {".rar", ".zip", ".tar", ".tar.gz", ".tgz",
+                ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+                ".tar.zst", ".gz", ".bz2", ".xz", ".zst"}
+
+
+def _double_ext(path: str) -> str:
+    """Return the effective compound extension (e.g. .tar.gz)."""
+    base = os.path.basename(path).lower()
+    for compound in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"):
+        if base.endswith(compound):
+            return compound
+    return os.path.splitext(path)[1].lower()
+
+
+def _is_archive(path: str) -> bool:
+    return _double_ext(path) in ARCHIVE_EXTS
 
 
 def split_file(path: str, max_size: int, mime_type: str | None = None) -> list[str]:
@@ -35,6 +70,12 @@ def split_file(path: str, max_size: int, mime_type: str | None = None) -> list[s
         if parts:
             return parts
         log.warning("ffmpeg split fell through to binary for %s", path)
+
+    if _is_archive(path):
+        parts = _split_archive_7z(path, max_size)
+        if parts:
+            return parts
+        log.warning("7z archive split fell through to binary for %s", path)
 
     return _split_binary(path, max_size)
 
@@ -129,7 +170,133 @@ def _split_binary(path: str, max_size: int) -> list[str]:
     return [path]
 
 
+# ── 7z archive volume split ───────────────────────────────────────
+
+def _split_archive_7z(path: str, max_size: int) -> list[str]:
+    """Repackage an archive as 7z volumes, each ≤ *max_size*.
+
+    Steps:
+      1. Extract the original archive to a temp directory.
+      2. Create 7z volumes (``-v`` switch) where each volume ≤ max_size.
+      3. If the archive was not a .7z, remove the original.
+      4. Verify every output volume exists and is within the limit.
+
+    Returns the list of volume paths on success, ``[]`` on failure.
+    """
+    file_size = os.path.getsize(path)
+    d = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+    base_no_ext = base
+    for ext in (_double_ext(path), os.path.splitext(path)[1]):
+        if base_no_ext.lower().endswith(ext):
+            base_no_ext = base_no_ext[: -len(ext)]
+            break
+
+    tmpdir = tempfile.mkdtemp(prefix="split7z_")
+    try:
+        # ── Step 1: Extract ──────────────────────────────────────────
+        extract_dir = os.path.join(tmpdir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        log.info("7z extracting %s → %s", base, extract_dir)
+
+        # 7z x preserves directory structure; -y auto-confirms overwrite
+        r = subprocess.run(
+            ["7z", "x", f"-o{extract_dir}", "-y", path],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            log.error("7z extract failed rc=%d: %s", r.returncode, r.stderr[-300:])
+            return []
+
+        # Find extracted contents (skip if 7z extracted into a subdirectory)
+        entries = os.listdir(extract_dir)
+        if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+            extract_dir = os.path.join(extract_dir, entries[0])
+
+        # ── Step 2: Create 7z volumes ───────────────────────────────
+        vol_size_str = str(max_size)  # bytes
+        out_archive = os.path.join(tmpdir, f"{base_no_ext}.7z")
+        log.info(
+            "7z creating volumes: %s -v%s -mx=3 (store-ish)",
+            base_no_ext, _human_size(max_size),
+        )
+        r = subprocess.run(
+            [
+                "7z", "a",
+                "-t7z",
+                "-mx=3",          # moderate compression — speed > ratio
+                f"-v{vol_size_str}",  # volume size in bytes
+                out_archive,
+                extract_dir,
+            ],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if r.returncode != 0:
+            log.error("7z create volumes failed rc=%d: %s", r.returncode, r.stderr[-300:])
+            return []
+
+        # ── Step 3: Collect volumes ──────────────────────────────────
+        # 7z names volumes: archive.7z.001, archive.7z.002, ...
+        # Single-volume archives keep the .7z extension (no .001 suffix).
+        vol_prefix = f"{base_no_ext}.7z"
+        volumes = []
+        for f in sorted(os.listdir(tmpdir)):
+            fp = os.path.join(tmpdir, f)
+            if not os.path.isfile(fp):
+                continue
+            # Match: exact base name (single vol) OR numbered volumes
+            if f == vol_prefix or f.startswith(f"{vol_prefix}."):
+                vol_size = os.path.getsize(fp)
+                if vol_size > max_size:
+                    log.error(
+                        "7z volume %s is %s (exceeds limit %s)",
+                        f, _human_size(vol_size), _human_size(max_size),
+                    )
+                    return []
+                volumes.append(fp)
+
+        if not volumes:
+            log.error("7z produced no volumes for %s", base)
+            return []
+
+        # If only 1 volume and it's the same size as the original,
+        # 7z couldn't split — fall through.
+        if len(volumes) == 1 and os.path.getsize(volumes[0]) >= file_size:
+            log.warning("7z single volume same size as original, falling through")
+            return []
+
+        # ── Step 4: Move volumes to JOB_DIR, remove original ────────
+        result: list[str] = []
+        for i, vp in enumerate(volumes):
+            vol_name = os.path.basename(vp)
+            dest = os.path.join(d, vol_name)
+            shutil.move(vp, dest)
+            result.append(dest)
+            log.info("  volume %d/%d: %s (%s)", i + 1, len(result), vol_name, _human_size(os.path.getsize(dest)))
+
+        os.remove(path)
+        log.info(
+            "7z split %s (%s) → %d volumes",
+            base, _human_size(file_size), len(result),
+        )
+        return result
+
+    except Exception as e:
+        log.error("7z archive split error: %s", e)
+        return []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ── helpers ─────────────────────────────────────────────────────────
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+
 
 def _collect_parts(path: str, predicate) -> list[str]:
     d = os.path.dirname(path) or "."
