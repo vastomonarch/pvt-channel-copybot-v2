@@ -354,7 +354,7 @@ ACTIVE_DL_STATES: dict[str, dict] = {}
 JOB_DIR = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "_pvtcopydl_tmp"
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SINGLE_FILE_BYTES = 1500 * 1024 * 1024  # 1.5 GB — safe under Telegram's 2GB limit + chunk count
+MAX_SINGLE_FILE_BYTES = 1000 * 1024 * 1024  # 1 GB — Telegram drops connections on uploads >1GB
 
 # User-account status edits are now reserved for milestones only (start,
 # crash, finish).  Live updates flow through the Bot.
@@ -1413,6 +1413,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                         # Retry this part up to 2 more times
                         for _ul_retry in range(2):
                             log.warning("UL retry %d part %d/%d for msg=%d", _ul_retry + 1, _part_idx + 1, len(_parts_to_upload), msg_id)
+                            await asyncio.sleep(10)  # wait for Telegram to recover
                             try:
                                 sent = await upload_with_progress(
                                     tc, dst_entity, _part_path, ul_progress,
