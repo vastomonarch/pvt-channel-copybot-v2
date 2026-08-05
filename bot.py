@@ -83,6 +83,7 @@ from pipeline import (
     render_job_progress,
     upload_with_progress,
 )
+from file_splitter import split_file
 
 # ===========================================================================
 # Logging  --  clean debug format
@@ -836,10 +837,10 @@ async def _redownload_media(msg, src_entity=None, retries: int = 2, tc: Telegram
     size = _media_size_bytes(msg)
     if size and size > MAX_SINGLE_FILE_BYTES:
         log.info(
-            "msg=%d skipped (>%s): %s",
-            msg.id, _human_bytes(MAX_SINGLE_FILE_BYTES), _human_bytes(size),
+            "msg=%d large file (%s) - will split after download",
+            msg.id, _human_bytes(size),
         )
-        return None, -1, 0.0
+        # Don't skip — download so caller can split
 
     fresh = msg
     last_err = None
@@ -1382,6 +1383,19 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                     log.warning("thumb file missing before upload, skipping: %s", thumb_path)
                     thumb_path = None
 
+                # ── Split large files before upload ──────────────────────
+                _file_size = os.path.getsize(path) if os.path.exists(path) else 0
+                _upload_parts: list[str] | None = None
+                if _file_size > MAX_SINGLE_FILE_BYTES:
+                    _upload_parts = split_file(path, MAX_SINGLE_FILE_BYTES, orig_mime)
+                    if len(_upload_parts) > 1:
+                        log.info(
+                            "split %s (%s) → %d parts",
+                            file_name, _human_bytes(_file_size), len(_upload_parts),
+                        )
+                    else:
+                        _upload_parts = None  # split failed or only 1 part
+
                 # Use pipeline upload with progress tracking
                 ul_progress = state.setdefault("_ul_progress", TransferProgress())
                 ul_progress.phase = "uploading"
@@ -1397,49 +1411,99 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                     state["upload_total"] = tp.total_bytes
                     state["upload_speed_bps"] = tp.speed_bps
                     await _refresh_bot_progress(state, force=True)
+
+                # ── Upload (single or split) ──────────────────────────────
+                _parts_to_upload = _upload_parts if _upload_parts else [path]
                 sent = None
+                upload_ok = False
                 t_ul_start = time.monotonic()
-                for attempt in range(4):
-                    try:
-                        sent = await upload_with_progress(
-                            tc, dst_entity, path, ul_progress,
-                            caption=cur.message or None,
-                            formatting_entities=cur.entities,
-                            attributes=orig_attrs if orig_attrs else None,
-                            mime_type=orig_mime,
-                            supports_streaming=orig_streaming,
-                            force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
-                            thumb=thumb_path,
-                            on_progress=_ul_on_progress,
-                        )
-                        break
-                    except (FloodWaitError, SlowModeWaitError) as e:
-                        flood_waits += 1
-                        state["flood_waits"] = flood_waits
-                        await _send_wait_sleep(e)
-                        continue
-                    except (ConnectionError, asyncio.TimeoutError):
-                        retries += 1
-                        state["retries"] = retries
-                        await asyncio.sleep(5)
-                        continue
-                    except FileReferenceExpiredError:
-                        retries += 1
-                        state["retries"] = retries
-                        cleanup_file(path)
-                        path2, code2, _ = await _redownload_media(cur, src_entity=src_entity, tc=tc)
-                        if code2 == -1 or not path2:
-                            errors += 1
-                            state["errors"] = errors
+
+                for _part_idx, _part_path in enumerate(_parts_to_upload):
+                    _is_split = len(_parts_to_upload) > 1
+                    _part_caption = cur.message or ""
+                    if _is_split:
+                        _part_caption += f"\n\n📦 Part {_part_idx + 1}/{len(_parts_to_upload)}"
+                    _part_name = os.path.basename(_part_path)
+                    _part_size = os.path.getsize(_part_path) if os.path.exists(_part_path) else 0
+                    state["upload_file_name"] = _part_name
+                    state["upload_total"] = _part_size
+
+                    sent = None
+                    for attempt in range(4):
+                        try:
+                            sent = await upload_with_progress(
+                                tc, dst_entity, _part_path, ul_progress,
+                                caption=_part_caption,
+                                formatting_entities=cur.entities,
+                                attributes=orig_attrs if orig_attrs else None,
+                                mime_type=orig_mime,
+                                supports_streaming=orig_streaming,
+                                force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
+                                thumb=thumb_path if _part_idx == 0 else None,
+                                on_progress=_ul_on_progress,
+                            )
                             break
-                        path = path2
-                        continue
+                        except (FloodWaitError, SlowModeWaitError) as e:
+                            flood_waits += 1
+                            state["flood_waits"] = flood_waits
+                            await _send_wait_sleep(e)
+                            continue
+                        except (ConnectionError, asyncio.TimeoutError):
+                            retries += 1
+                            state["retries"] = retries
+                            await asyncio.sleep(5)
+                            continue
+                        except FileReferenceExpiredError:
+                            retries += 1
+                            state["retries"] = retries
+                            cleanup_file(_part_path)
+                            path2, code2, _ = await _redownload_media(cur, src_entity=src_entity, tc=tc)
+                            if code2 == -1 or not path2:
+                                errors += 1
+                                state["errors"] = errors
+                                break
+                            _part_path = path2
+                            continue
+
+                    if sent is None or not await _verify_uploaded(dst_entity, sent, cur, tc=tc):
+                        # Retry this part up to 2 more times
+                        for _ul_retry in range(2):
+                            log.warning("UL retry %d part %d/%d for msg=%d", _ul_retry + 1, _part_idx + 1, len(_parts_to_upload), msg_id)
+                            try:
+                                sent = await upload_with_progress(
+                                    tc, dst_entity, _part_path, ul_progress,
+                                    caption=_part_caption,
+                                    formatting_entities=cur.entities,
+                                    attributes=orig_attrs if orig_attrs else None,
+                                    mime_type=orig_mime,
+                                    supports_streaming=orig_streaming,
+                                    force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
+                                    thumb=thumb_path if _part_idx == 0 else None,
+                                    on_progress=_ul_on_progress,
+                                )
+                                if sent and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
+                                    upload_ok = True
+                                    break
+                            except (FloodWaitError, SlowModeWaitError) as e:
+                                await _send_wait_sleep(e)
+                            except Exception as e:
+                                log.warning("UL retry failed msg=%d part %d: %s", msg_id, _part_idx + 1, e)
+                        if not upload_ok and sent is None:
+                            break  # stop uploading remaining parts
+                    else:
+                        upload_ok = True
+
                 # Cleanup thumb temp file
                 if thumb_path and os.path.exists(thumb_path):
                     try:
                         os.remove(thumb_path)
                     except Exception:
                         pass
+                # Cleanup split parts
+                if _upload_parts:
+                    for _p in _upload_parts:
+                        _safe_unlink(_p)
+
                 t_ul_end = time.monotonic()
                 ul_elapsed = t_ul_end - t_ul_start
                 state["upload_phase"] = "idle"
@@ -1448,57 +1512,31 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 await _refresh_bot_progress(state, force=True)
 
                 log.info(
-                    "UL msg=%d file=%s elapsed=%.2fs speed=%s sent=%s",
-                    msg_id, file_name or "?", ul_elapsed,
-                    _human_speed(os.path.getsize(path) / max(ul_elapsed, 0.001)) if path and os.path.exists(path) and ul_elapsed > 0 else "—",
-                    "ok" if sent else "FAILED",
+                    "UL msg=%d file=%s parts=%d elapsed=%.2fs sent=%s",
+                    msg_id, file_name or "?", len(_parts_to_upload), ul_elapsed,
+                    "ok" if upload_ok else "FAILED",
                 )
 
-                if sent is not None and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
+                if upload_ok:
                     uploaded += 1
                     state["uploaded"] = uploaded
-                    _safe_unlink(path)
-                else:
-                    # Upload failed - retry up to 2 more times
-                    upload_ok = False
-                    for _ul_retry in range(2):
-                        log.warning("UL retry %d for msg=%d", _ul_retry + 1, msg_id)
-                        try:
-                            sent = await upload_with_progress(
-                                tc, dst_entity, path, ul_progress,
-                                caption=cur.message or None,
-                                formatting_entities=cur.entities,
-                                attributes=orig_attrs if orig_attrs else None,
-                                mime_type=orig_mime,
-                                supports_streaming=orig_streaming,
-                                force_document=orig_mime and orig_mime.startswith("video/") and not orig_streaming,
-                                thumb=thumb_path,
-                                on_progress=_ul_on_progress,
-                            )
-                            if sent and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
-                                upload_ok = True
-                                uploaded += 1
-                                state["uploaded"] = uploaded
-                                _safe_unlink(path)
-                                break
-                        except (FloodWaitError, SlowModeWaitError) as e:
-                            await _send_wait_sleep(e)
-                        except Exception as e:
-                            log.warning("UL retry failed msg=%d: %s", msg_id, e)
-                    if not upload_ok:
-                        errors += 1
-                        state["errors"] = errors
+                    if not _upload_parts:
                         _safe_unlink(path)
-                        # Stop job and report error
-                        try:
-                            await status_msg.edit(
-                                f"❌ Upload failed for msg={msg_id} ({file_name or '?'})\n"
-                                f"Downloaded: {_human_bytes(code)}\n"
-                                f"Job stopped. Fix the issue and restart."
-                            )
-                        except Exception:
-                            pass
-                        return  # stop the job
+                else:
+                    errors += 1
+                    state["errors"] = errors
+                    if not _upload_parts:
+                        _safe_unlink(path)
+                    # Stop job and report error
+                    try:
+                        await status_msg.edit(
+                            f"❌ Upload failed for msg={msg_id} ({file_name or '?'})\n"
+                            f"Downloaded: {_human_bytes(code)}\n"
+                            f"Job stopped. Fix the issue and restart."
+                        )
+                    except Exception:
+                        pass
+                    return  # stop the job
                 state["current_msg_id"] = msg_id + 1
                 pass  # ponytail: resume removed
                 sent_after_point = sent_after_attempt = True
