@@ -378,6 +378,66 @@ def _job_key(src_id, start_id: int, end_id: int) -> str:
     return hashlib.sha1(s).hexdigest()[:12]
 
 
+def _job_meta_path(job_key: str) -> pathlib.Path:
+    return JOB_DIR / f"{job_key}_meta.json"
+
+
+def _save_job_meta(state: dict) -> None:
+    """Persist job state to disk so .continue can resume after restart."""
+    meta = {
+        "job_key": state["job_key"],
+        "src": state["src"],
+        "dst": state["dst"],
+        "start_msg_id": state["start_msg_id"],
+        "end_msg_id": state["end_msg_id"],
+        "current_msg_id": state["current_msg_id"],
+        "downloaded": state.get("downloaded", 0),
+        "uploaded": state.get("uploaded", 0),
+        "skipped": state.get("skipped", 0),
+        "errors": state.get("errors", 0),
+        "uploaded_msgs": state.get("uploaded_msgs", []),
+        "skipped_msgs": state.get("skipped_msgs", []),
+    }
+    try:
+        _job_meta_path(state["job_key"]).write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+    except OSError as e:
+        log.debug("save meta failed: %s", e)
+
+
+def _load_job_meta(job_key: str) -> dict | None:
+    path = _job_meta_path(job_key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _cleanup_job_meta(job_key: str) -> None:
+    path = _job_meta_path(job_key)
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _find_local_file(msg_id: int, file_name: str) -> str | None:
+    """Check if a file for this message already exists locally."""
+    if not file_name:
+        return None
+    # Check direct match
+    direct = JOB_DIR / file_name
+    if direct.exists() and direct.stat().st_size > 0:
+        return str(direct)
+    # Check split parts — if all parts exist, return the original name
+    # (the upload logic will re-split if needed)
+    return None
+
+
 # ponytail: resume feature removed per user request
 def _safe_unlink(path) -> None:
     if not path:
@@ -1195,6 +1255,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 if sent and await _verify_uploaded(dst_entity, sent, cur, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
+                    state["uploaded_msgs"].append(msg_id)
                 else:
                     errors += 1
                     state["errors"] = errors
@@ -1207,6 +1268,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 if sent:
                     uploaded += 1
                     state["uploaded"] = uploaded
+                    state["uploaded_msgs"].append(msg_id)
                 else:
                     state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
@@ -1217,6 +1279,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 if await _reupload_contact(cur, dst_entity, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
+                    state["uploaded_msgs"].append(msg_id)
                 else:
                     state["skipped"] = (state.get("skipped", 0) + 1)
                 state["current_msg_id"] = msg_id + 1
@@ -1227,6 +1290,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 if await _reupload_location(cur, dst_entity, tc=tc):
                     uploaded += 1
                     state["uploaded"] = uploaded
+                    state["uploaded_msgs"].append(msg_id)
                 else:
                     state["skipped"] = (state.get("skipped", 0)) + 1
                 state["current_msg_id"] = msg_id + 1
@@ -1263,10 +1327,18 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                     await _refresh_bot_progress(state, force=True)
                 # Get expected size for logging
                 _exp_size = _media_size_bytes(cur)
-                path, code, elapsed = await download_with_progress(
-                    tc, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
-                    on_progress=_dl_on_progress,
-                )
+                # Check if file already exists locally (from previous interrupted run)
+                _local = _find_local_file(msg_id, file_name)
+                if _local:
+                    path = _local
+                    code = os.path.getsize(path)
+                    elapsed = 0.0
+                    log.info("DL msg=%d file=%s SKIP (exists locally, %s)", msg_id, file_name, _human_bytes(code))
+                else:
+                    path, code, elapsed = await download_with_progress(
+                        tc, cur, str(JOB_DIR), dl_progress, src_entity=src_entity,
+                        on_progress=_dl_on_progress,
+                    )
                 log.info(
                     "DL msg=%d file=%s code=%d exp=%d elapsed=%.2fs speed=%s path=%s",
                     msg_id, file_name or "?", code, _exp_size, elapsed,
@@ -1465,6 +1537,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                 if upload_ok:
                     uploaded += 1
                     state["uploaded"] = uploaded
+                    state["uploaded_msgs"].append(msg_id)
                     if not _upload_parts:
                         _safe_unlink(path)
                 else:
@@ -1557,6 +1630,7 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
 
         # ---- progress routing --------------------------------------------
         processed += 1
+        _save_job_meta(state)
         now = time.monotonic()
 
         # Direct progress edit via user client (throttled to every 2.5s)
@@ -1616,6 +1690,148 @@ async def handle_pvtcopydlcancel(event):
         return
     task.cancel()
     await event.respond(f"cancelling job `{key}`.")
+
+
+# ===========================================================================
+# .pvtcopydlcontinue  --  Resume an interrupted job
+# ===========================================================================
+@client.on(events.NewMessage(pattern=r"\.pvtcopydlcontinue\s+(\S+)", func=lambda e: e.sender_id == ME_ID))
+async def handle_pvtcopydlcontinue(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+
+    job_key = event.pattern_match.group(1)
+    meta = _load_job_meta(job_key)
+    if not meta:
+        await event.respond(f"no saved job found for key `{job_key}`.")
+        return
+
+    if job_key in ACTIVE_DL_JOBS:
+        task = ACTIVE_DL_JOBS[job_key]
+        if task and not task.done():
+            await event.respond(f"job `{job_key}` is already running.")
+            return
+
+    src_identifier = meta["src"]
+    dst_identifier = meta["dst"]
+    start_msg_id = meta["start_msg_id"]
+    end_msg_id = meta["end_msg_id"]
+    current_msg_id = meta["current_msg_id"]
+    uploaded_msgs = set(meta.get("uploaded_msgs", []))
+    skipped_msgs = set(meta.get("skipped_msgs", []))
+
+    if current_msg_id > end_msg_id:
+        await event.respond(f"job `{job_key}` was already complete (uploaded={meta.get('uploaded', 0)}).")
+        return
+
+    try:
+        src_entity = await client.get_entity(src_identifier)
+        dst_entity = await client.get_entity(dst_identifier)
+    except Exception as e:
+        await event.respond(f"cannot resolve channel: {e}")
+        return
+
+    remaining = end_msg_id - current_msg_id + 1
+    already = len(uploaded_msgs) + len(skipped_msgs)
+
+    state = {
+        "job_key": job_key,
+        "src": str(src_identifier),
+        "dst": str(dst_identifier),
+        "start_msg_id": start_msg_id,
+        "end_msg_id": end_msg_id,
+        "current_msg_id": current_msg_id,
+        "total": meta.get("total", end_msg_id - start_msg_id + 1),
+        "downloaded": meta.get("downloaded", 0),
+        "uploaded": meta.get("uploaded", 0),
+        "skipped": meta.get("skipped", 0),
+        "errors": meta.get("errors", 0),
+        "retries": 0,
+        "flood_waits": 0,
+        "eta": ETA_NA,
+        "per_item_times": [],
+        "speed_window": [],
+        "download_speed_bps": 0.0,
+        "bytes_downloaded_total": 0,
+        "upload_phase": "idle",
+        "upload_file_name": "",
+        "upload_current": 0,
+        "upload_total": 0,
+        "upload_speed_bps": 0.0,
+        "upload_bytes_total": 0,
+        "upload_speed_window": [],
+        "uploaded_msgs": list(uploaded_msgs),
+        "skipped_msgs": list(skipped_msgs),
+        "started_at": time.time(),
+        "_spinner": Spinner(),
+    }
+
+    spinner = state["_spinner"]
+    channel_display = getattr(src_entity, "title", None) or str(src_identifier)
+    initial_text = render_copy_progress(
+        spinner=spinner,
+        mode="download",
+        job_key=job_key,
+        current_msg=current_msg_id,
+        total=state["total"],
+        downloaded=state["downloaded"],
+        uploaded=state["uploaded"],
+        skipped=state["skipped"],
+        errors=state["errors"],
+        speed=0.0,
+        eta=0.0,
+        elapsed=0.0,
+        filename="",
+        start_msg=start_msg_id,
+    )
+    status_msg = await event.respond(
+        f"▶️ resuming job `{job_key}` from msg {current_msg_id} ({remaining} remaining, {already} already done)\n\n"
+        + initial_text,
+        buttons=_job_inline_buttons(job_key),
+    )
+    state["progress_chat_id"] = event.chat_id
+    state["progress_msg_id"] = status_msg.id
+    state["progress_last_edit"] = time.monotonic()
+
+    task = asyncio.current_task()
+    ACTIVE_DL_JOBS[job_key] = task
+    ACTIVE_DL_STATES[job_key] = state
+    log.info("pvtcopydl CONTINUE key=%s from msg=%d", job_key, current_msg_id)
+
+    try:
+        await _loop_pvtcopydl(state, src_entity, dst_entity, status_msg)
+    except asyncio.CancelledError:
+        log.info("pvtcopydl CANCEL key=%s", job_key)
+        raise
+    except Exception as e:
+        log.exception("pvtcopydl CRASH key=%s err=%s", job_key, e)
+        try:
+            await status_msg.edit(f"❌ pvtcopydl crashed: {e}")
+        except Exception:
+            pass
+        return
+    finally:
+        ACTIVE_DL_JOBS.pop(job_key, None)
+        ACTIVE_DL_STATES.pop(job_key, None)
+
+    try:
+        tail_id = state["current_msg_id"]
+        elapsed = time.time() - state.get("started_at", time.time())
+        if tail_id > end_msg_id:
+            _cleanup_job_meta(job_key)
+            final_text = render_copy_completed(
+                mode="download",
+                job_key=job_key,
+                total=state["total"],
+                downloaded=state["downloaded"],
+                uploaded=state["uploaded"],
+                skipped=state["skipped"],
+                errors=state["errors"],
+                elapsed=elapsed,
+            )
+            await status_msg.edit(final_text)
+    except Exception as e:
+        log.warning("final status update failed: %s", e)
 
 
 # ===========================================================================
@@ -1693,6 +1909,8 @@ async def handle_pvtcopydl(event):
             "upload_speed_bps": 0.0,
             "upload_bytes_total": 0,
             "upload_speed_window": [],
+            "uploaded_msgs": [],
+            "skipped_msgs": [],
             "started_at": time.time(),
             "_spinner": Spinner(),
         }
@@ -1776,6 +1994,7 @@ async def handle_pvtcopydl(event):
         tail_id = state["current_msg_id"]
         elapsed = time.time() - state.get("started_at", time.time())
         if tail_id > end_msg_id:
+            _cleanup_job_meta(job_key)
             if state.get("uploaded", 0) > 0:
                 
                 log.info(
@@ -2256,6 +2475,8 @@ async def handle_help(event):
         "    for channels where forwarding is disabled.\n"
         f"    live progress (bar / eta / speed / refresh) appears in chat with {bot_friendly}.\n"
         "    ETA derived from rolling per-item times.\n\n"
+        ".pvtcopydlcontinue <job_key>\n"
+        "    resume an interrupted .pvtcopydl job from where it left off.\n\n"
         ".pvtcopydlcancel <job_key>\n"
         "    cancel a .pvtcopydl job.\n\n"
         ".del <start_link> <end_link>\n"
