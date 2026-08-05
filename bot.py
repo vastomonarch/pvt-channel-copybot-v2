@@ -208,7 +208,7 @@ def _human_eta(seconds: float) -> str:
 # ===========================================================================
 # Clients & Session Management
 # ===========================================================================
-from session_manager import SessionManager, mask_phone
+from session_manager import SessionManager, mask_phone, _enable_wal_journal
 
 # ─ Session directory ────────────────────────────────────────────────
 SESSIONS_DIR = pathlib.Path(__file__).resolve().parent / "sessions"
@@ -240,6 +240,7 @@ client = session_manager.create_or_get_client("default")
 BOT_SESSION_NAME = "copybot_bot_session"
 bot_client: TelegramClient | None = None
 if BOT_TOKEN:
+    _enable_wal_journal(BOT_SESSION_NAME)
     bot_client = TelegramClient(BOT_SESSION_NAME, API_ID, API_HASH)
 
 # Filled once both clients are ready (in main()).

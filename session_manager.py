@@ -24,10 +24,19 @@ def _enable_wal_journal(path: str) -> None:
     """Enable WAL journal mode on SQLite session files to avoid lock issues."""
     if not os.path.exists(path):
         return
+    # Remove stale WAL/SHM files from crashed sessions
+    for suffix in ("-wal", "-shm"):
+        stale = path + suffix
+        if os.path.exists(stale) and os.path.getsize(stale) == 0:
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
     try:
-        c = sqlite3.connect(path, timeout=5, isolation_level=None)
+        c = sqlite3.connect(path, timeout=10, isolation_level=None)
         c.execute("PRAGMA journal_mode=WAL;")
         c.execute("PRAGMA synchronous=NORMAL;")
+        c.execute("PRAGMA busy_timeout=5000;")
         c.close()
     except Exception as e:
         log.debug("WAL setup failed for %s: %s", path, e)
