@@ -208,39 +208,17 @@ def _human_eta(seconds: float) -> str:
 # ===========================================================================
 # Clients & Session Management
 # ===========================================================================
-from session_manager import SessionManager, mask_phone, _enable_wal_journal
+from wal_session import WALSession
 
-# ─ Session directory ────────────────────────────────────────────────
-SESSIONS_DIR = pathlib.Path(__file__).resolve().parent / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_NAME = str(pathlib.Path(__file__).resolve().parent / "copybot_session")
 
-# Migrate existing root session file to sessions/ on first run so both the
-# module-level `client` and the session_manager share the same directory.
-_old_root_sess = pathlib.Path(__file__).resolve().parent / "copybot_session.session"
-_new_default_sess = SESSIONS_DIR / "default.session"
-if _old_root_sess.exists() and not _new_default_sess.exists():
-    import shutil
-    shutil.copy2(_old_root_sess, _new_default_sess)
-    for _sfx in ("-shm", "-wal"):
-        _src = pathlib.Path(str(_old_root_sess) + _sfx)
-        if _src.exists():
-            shutil.copy2(_src, SESSIONS_DIR / f"default{_sfx}")
-    log.info("migrated copybot_session.session → sessions/default.session")
-
-SESSION_NAME = str(SESSIONS_DIR / "default")  # absolute path without .session
-session_manager = SessionManager(API_ID, API_HASH, sessions_dir=SESSIONS_DIR)
-
-# Primary user client (backward compatible).
-# This is shared with session_manager so that the module-level `client`
-# and session_manager.get_client("default") return the same instance.
-client = session_manager.create_or_get_client("default")
+# Primary user client
+client = TelegramClient(WALSession(SESSION_NAME), API_ID, API_HASH)
 
 # Second Telethon client acts as a Telegram *bot* driven by the BOT_TOKEN.
-# Both run in the same asyncio loop so they share in-memory state directly.
 BOT_SESSION_NAME = "copybot_bot_session"
 bot_client: TelegramClient | None = None
 if BOT_TOKEN:
-    from wal_session import WALSession
     bot_client = TelegramClient(WALSession(BOT_SESSION_NAME), API_ID, API_HASH)
 
 # Filled once both clients are ready (in main()).
@@ -323,42 +301,7 @@ def get_selected_destination() -> int:
     return int(cfg["selected"])
 
 
-# ===========================================================================
-# Session flag parser (-s <name>)
-# ===========================================================================
-def parse_session_flag(text: str) -> tuple[str | None, str]:
-    """Parse optional '-s <session>' from command text.
 
-    Returns (session_name_or_None, cleaned_text_without_flag).
-    """
-    m = re.search(r"-s\s+(\S+)", text)
-    if m:
-        session_name = m.group(1)
-        cleaned = text[: m.start()] + text[m.end() :]
-        return session_name, cleaned.strip()
-    return None, text
-
-
-def get_client_for_command(event_client: TelegramClient, session_name: str | None = None) -> TelegramClient:
-    """Get the appropriate client for a command.
-
-    Priority:
-    1. If session_name is provided via `-s <name>`, use that session's client.
-    2. Otherwise, use the session_manager's active/default session.
-    3. Fall back to the event's client (backward compat).
-    """
-    if session_name:
-        is_valid, err = session_manager.validate_session(session_name)
-        if not is_valid:
-            raise ValueError(err)
-        return session_manager.get_client(session_name)
-    active = session_manager.get_active_name()
-    if active:
-        try:
-            return session_manager.get_client(active)
-        except ValueError:
-            pass
-    return event_client
 
 
 # ===========================================================================
@@ -1682,20 +1625,14 @@ async def handle_pvtcopydl(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
 
-    # Parse optional -s flag
-    session_name, cleaned_text = parse_session_flag(event.message.text)
-    try:
-        tc = get_client_for_command(client, session_name)
-    except ValueError as e:
-        await event.respond(str(e))
-        return
-
-    m = re.search(r"\.pvtcopydl\s+(\S+)\s+(\S+)", cleaned_text)
+    m = re.search(r"\.pvtcopydl\s+(\S+)\s+(\S+)", event.message.text)
     if not m:
         await event.respond("invalid format.")
         return
     start_link = m.group(1)
     end_link = m.group(2)
+
+    tc = client
 
     start = parse_message_link(start_link)
     end = parse_message_link(end_link)
@@ -1731,7 +1668,6 @@ async def handle_pvtcopydl(event):
 
     state = {
             "job_key": job_key,
-            "session": session_name or session_manager.get_active_name(),
             "src": str(src_identifier),
             "dst": str(dest_channel_id),
             "start_msg_id": start_msg_id,
@@ -1873,44 +1809,18 @@ async def handle_logout(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
 
-    # Parse optional -s flag
-    session_name, _ = parse_session_flag(event.message.text)
-
-    if session_name:
-        # Log out specific session
-        if not session_manager.has_session(session_name):
-            await event.respond(f"session '{session_name}' not found.")
-            return
-
-        # Check if any jobs are running on this session
-        for job_key, state in ACTIVE_DL_STATES.items():
-            if state.get("session") == session_name:
-                await event.respond(
-                    f"cannot logout session '{session_name}': job '{job_key}' is running.\n"
-                    "cancel the job first with .pvtcopydlcancel"
-                )
-                return
-
+    await event.respond("logging out; deleting session file.")
+    session_file = f"{SESSION_NAME}.session"
+    await client.disconnect()
+    if os.path.exists(session_file):
+        os.remove(session_file)
+        log.info("session deleted: %s", session_file)
+    if bot_client is not None:
         try:
-            await session_manager.remove_session(session_name)
-            await event.respond(f"session '{session_name}' logged out and removed.")
-        except Exception as e:
-            await event.respond(f"failed to logout: {e}")
-    else:
-        # Log out default session (original behavior)
-        await event.respond("logging out; deleting session file.")
-        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    f"{SESSION_NAME}.session")
-        await client.disconnect()
-        if os.path.exists(session_file):
-            os.remove(session_file)
-            log.info("session deleted: %s", session_file)
-        if bot_client is not None:
-            try:
-                await bot_client.disconnect()
-            except Exception:
-                pass
-        os._exit(0)
+            await bot_client.disconnect()
+        except Exception:
+            pass
+    os._exit(0)
 
 
 @client.on(events.NewMessage(pattern=r"\.adest\s+(-?\d+)"))
@@ -1964,15 +1874,7 @@ async def handle_pvtcopy(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
 
-    # Parse optional -s flag
-    session_name, cleaned_text = parse_session_flag(event.message.text)
-    try:
-        tc = get_client_for_command(client, session_name)
-    except ValueError as e:
-        await event.respond(str(e))
-        return
-
-    m = re.search(r"\.pvtcopy\s+(\S+)\s+(\S+)", cleaned_text)
+    m = re.search(r"\.pvtcopy\s+(\S+)\s+(\S+)", event.message.text)
     if not m:
         await event.respond("invalid format.")
         return
@@ -2129,15 +2031,7 @@ async def handle_del(event):
     Usage:  .del <start_link> <end_link>
     Both links must belong to the same chat/channel.
     """
-    # Parse optional -s flag
-    session_name, cleaned_text = parse_session_flag(event.message.text)
-    try:
-        tc = get_client_for_command(client, session_name)
-    except ValueError as e:
-        await event.respond(str(e))
-        return
-
-    m = re.search(r"\.del\s+(\S+)\s+(\S+)", cleaned_text)
+    m = re.search(r"\.del\s+(\S+)\s+(\S+)", event.message.text)
     if not m:
         await event.respond("invalid format.")
         return
@@ -2344,237 +2238,6 @@ async def handle_del(event):
     )
 
 
-# ===========================================================================
-# .session  --  Multi-session management
-# ===========================================================================
-# Pending login state for .session add flow
-# Keyed by sender_id so bot_client and user_client share the flow state.
-_pending_logins: dict[int, dict] = {}  # sender_id -> {name, client, step, phone}
-
-
-@client.on(events.NewMessage(pattern=r"\.session\s+add\s+(\S+)"))
-async def handle_session_add(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-    name = event.pattern_match.group(1)
-    user_id = event.sender_id
-
-    if session_manager.has_session(name):
-        await event.respond(f"session '{name}' already exists.")
-        return
-
-    try:
-        new_client = await session_manager.add_session(name)
-    except ValueError as e:
-        await event.respond(str(e))
-        return
-
-    # Start the login flow
-    try:
-        await new_client.connect()
-    except Exception as e:
-        await event.respond(f"failed to connect: {e}")
-        return
-
-    if await new_client.is_user_authorized():
-        # Already authorized (migrated session)
-        me = await new_client.get_me()
-        session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
-        if not session_manager.get_active_name():
-            session_manager.set_active(name)
-        await event.respond(f"session '{name}' authorized as {me.first_name} (id={me.id}).")
-        return
-
-    # Store state for the conversation flow
-    _pending_logins[user_id] = {
-        "name": name,
-        "client": new_client,
-        "step": "phone",
-    }
-    await event.respond(
-        f"session '{name}' created.\n"
-        "please send your phone number (with country code, e.g. +1234567890):\n"
-        "send .session cancel to abort."
-    )
-
-
-@client.on(events.NewMessage(pattern=r"\.session\s+list"))
-async def handle_session_list(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-
-    sessions = session_manager.list_sessions()
-    if not sessions:
-        await event.respond("no sessions configured.")
-        return
-
-    lines = ["configured sessions:\n"]
-    for s in sessions:
-        status = "✅ authorized" if s["authorized"] else "⏳ pending"
-        active = " • 🔵 active" if s["active"] else ""
-        phone_display = mask_phone(s["phone"]) if s["phone"] not in ("pending", "unknown") else "(login in progress)" if s["phone"] == "pending" else "(unknown)"
-        lines.append(f"  • {s['name']}: {phone_display} • {status}{active}")
-
-    await event.respond("\n".join(lines))
-
-
-@client.on(events.NewMessage(pattern=r"\.session\s+use\s+(\S+)"))
-async def handle_session_use(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-    name = event.pattern_match.group(1)
-
-    is_valid, err = session_manager.validate_session(name)
-    if not is_valid:
-        await event.respond(err)
-        return
-
-    session_manager.set_active(name)
-    await event.respond(f"active session set to '{name}'.")
-
-
-@client.on(events.NewMessage(pattern=r"\.session\s+current"))
-async def handle_session_current(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-
-    active = session_manager.get_active_name()
-    if not active:
-        await event.respond("no active session.")
-        return
-
-    is_valid, _ = session_manager.validate_session(active)
-    status = "authorized" if is_valid else "not authorized"
-    await event.respond(f"active session: {active} ({status})")
-
-
-@client.on(events.NewMessage(pattern=r"\.session\s+remove\s+(\S+)"))
-async def handle_session_remove(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-    name = event.pattern_match.group(1)
-
-    if not session_manager.has_session(name):
-        await event.respond(f"session '{name}' not found.")
-        return
-
-    # Check if any jobs are running on this session
-    for job_key, state in ACTIVE_DL_STATES.items():
-        if state.get("session") == name:
-            await event.respond(
-                f"cannot remove session '{name}': job '{job_key}' is running on it.\n"
-                "cancel the job first with .pvtcopydlcancel"
-            )
-            return
-
-    try:
-        await session_manager.remove_session(name)
-        await event.respond(f"session '{name}' removed.")
-    except ValueError as e:
-        await event.respond(str(e))
-
-
-# Handle pending login conversation flow
-@client.on(events.NewMessage(func=lambda e: e.sender_id in _pending_logins))
-async def handle_session_login_flow(event):
-    if ME_ID and event.sender_id != ME_ID:
-        return
-
-    user_id = event.sender_id
-    state = _pending_logins.get(user_id)
-    if not state:
-        return
-
-    text = event.message.text.strip()
-    name = state["name"]
-    telethon_client = state["client"]
-    step = state["step"]
-
-    if text.lower() == ".session cancel":
-        del _pending_logins[user_id]
-        try:
-            await telethon_client.disconnect()
-        except Exception:
-            pass
-        await event.respond(f"session '{name}' login cancelled.")
-        return
-
-    if step == "phone":
-        # User sent phone number
-        phone = text
-        if not phone.startswith("+"):
-            await event.respond("phone must start with + and include country code.")
-            return
-
-        try:
-            await telethon_client.send_code_request(phone)
-            state["step"] = "code"
-            state["phone"] = phone
-            await event.respond("code sent. please send the login code:")
-        except Exception as e:
-            del _pending_logins[user_id]
-            try:
-                await telethon_client.disconnect()
-            except Exception:
-                pass
-            await event.respond(f"failed to send code: {e}")
-
-    elif step == "code":
-        # User sent login code – strip spaces (Telegram may send "5 4 3 7 1")
-        code = text.replace(" ", "")
-        phone = state.get("phone", "")
-
-        try:
-            await telethon_client.sign_in(phone, code)
-            me = await telethon_client.get_me()
-            session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
-
-            if not session_manager.get_active_name():
-                session_manager.set_active(name)
-
-            del _pending_logins[user_id]
-            await event.respond(
-                f"session '{name}' authorized as {me.first_name} (id={me.id}).\n"
-                f"use .session use {name} to make it the default."
-            )
-        except SessionPasswordNeededError:
-            # 2FA enabled – ask for cloud password
-            state["step"] = "password"
-            await event.respond(
-                "this account has 2FA enabled.\n"
-                "please send your cloud password (not the login code):"
-            )
-        except Exception as e:
-            del _pending_logins[user_id]
-            try:
-                await telethon_client.disconnect()
-            except Exception:
-                pass
-            await event.respond(f"login failed: {e}")
-
-    elif step == "password":
-        # User sent cloud password (2FA)
-        password = text
-        try:
-            await telethon_client.sign_in(password=password)
-            me = await telethon_client.get_me()
-            session_manager.update_session_info(name, phone=getattr(me, "phone", None), authorized=True)
-
-            if not session_manager.get_active_name():
-                session_manager.set_active(name)
-
-            del _pending_logins[user_id]
-            await event.respond(
-                f"session '{name}' authorized as {me.first_name} (id={me.id}).\n"
-                f"use .session use {name} to make it the default."
-            )
-        except Exception as e:
-            del _pending_logins[user_id]
-            try:
-                await telethon_client.disconnect()
-            except Exception:
-                pass
-            await event.respond(f"login failed: {e}")
 
 
 @client.on(events.NewMessage(pattern=r"\.help"))
@@ -2600,13 +2263,6 @@ async def handle_help(event):
         ".adest <channel_id>\n"
         "    .showdest  — add or browse destination channels.\n\n"
         ".logout — disconnect.\n\n"
-        ".session add <name>    — login a new Telegram account.\n"
-        ".session list          — show all configured sessions.\n"
-        ".session use <name>    — set the default session.\n"
-        ".session current       — show the active session.\n"
-        ".session remove <name> — remove a session.\n\n"
-        "optional: use -s <session> with any command to specify session.\n"
-        "    example: .pvtcopy -s backup <start> <end>\n\n"
         ".help — this message."
     )
 
@@ -2659,18 +2315,6 @@ def _register_bot_handlers() -> None:
     async def _bot_cancel(event):
         job_key = event.pattern_match.group(1).decode()
         await _cancel_for(event, job_key)
-
-    # ── Session management via bot ──────────────────────────────────
-    # Re-use the same module-level handlers. We register them here so
-    # the owner can add/list/remove sessions through the bot as well.
-    # The ME_ID check inside each handler ensures only the owner can
-    # run these commands.
-    bot_client.add_event_handler(handle_session_add, events.NewMessage(pattern=r"\.session\s+add\s+(\S+)"))
-    bot_client.add_event_handler(handle_session_list, events.NewMessage(pattern=r"\.session\s+list"))
-    bot_client.add_event_handler(handle_session_use, events.NewMessage(pattern=r"\.session\s+use\s+(\S+)"))
-    bot_client.add_event_handler(handle_session_current, events.NewMessage(pattern=r"\.session\s+current"))
-    bot_client.add_event_handler(handle_session_remove, events.NewMessage(pattern=r"\.session\s+remove\s+(\S+)"))
-    bot_client.add_event_handler(handle_session_login_flow, events.NewMessage(func=lambda e: e.sender_id in _pending_logins))
 
 
 async def _refresh_for(event, job_key: str | None, *, force: bool) -> None:
@@ -2784,34 +2428,16 @@ async def main():
     # SyntaxError later in this function.
     global ME_ID, BOT_USERNAME, BOT_ID, bot_client, client
 
-    # ── Load all session files ──────────────────────────────────────
-    loaded = await session_manager.load_sessions()
-    log.info("loaded sessions: %s", loaded)
-
-    # Connect the primary session (backward compatible)
-    log.info("connecting primary userbot...")
+    # Connect the primary session
+    log.info("connecting userbot...")
     await client.start()
     me = await client.get_me()
     ME_ID = me.id
-
-    # Register this session in the session_manager if not already present
-    active_name = session_manager.get_active_name()
-    if not active_name:
-        session_manager.set_active("default")
-        active_name = "default"
-    session_manager.update_session_info(active_name, phone=getattr(me, "phone", None), authorized=True)
 
     log.info(
         "userbot OK: %s (id=%d)  active-dst=%s",
         me.first_name, me.id, get_selected_destination(),
     )
-
-    # ── Connect additional sessions ─────────────────────────────────
-    results = await session_manager.connect_all()
-    for name, ok in results.items():
-        if name != active_name:
-            status = "OK" if ok else "FAILED"
-            log.info("session %s: %s", name, status)
 
     if bot_client is not None:
         try:
