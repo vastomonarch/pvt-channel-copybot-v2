@@ -129,9 +129,9 @@ class SessionManager:
     # ── Client lifecycle ─────────────────────────────────────────────
 
     def _create_client(self, name: str) -> TelegramClient:
+        from wal_session import WALSession
         session_path = self._session_path(name)
-        _enable_wal_journal(str(session_path))
-        return TelegramClient(str(session_path), self.api_id, self.api_hash)
+        return TelegramClient(WALSession(str(session_path)), self.api_id, self.api_hash)
 
     def create_or_get_client(self, name: str) -> TelegramClient:
         """Get an existing client or create a new one.

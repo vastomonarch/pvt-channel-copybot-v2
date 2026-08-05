@@ -240,8 +240,8 @@ client = session_manager.create_or_get_client("default")
 BOT_SESSION_NAME = "copybot_bot_session"
 bot_client: TelegramClient | None = None
 if BOT_TOKEN:
-    _enable_wal_journal(BOT_SESSION_NAME)
-    bot_client = TelegramClient(BOT_SESSION_NAME, API_ID, API_HASH)
+    from wal_session import WALSession
+    bot_client = TelegramClient(WALSession(BOT_SESSION_NAME), API_ID, API_HASH)
 
 # Filled once both clients are ready (in main()).
 ME_ID: int | None = None
