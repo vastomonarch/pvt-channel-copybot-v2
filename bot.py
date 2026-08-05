@@ -354,7 +354,7 @@ ACTIVE_DL_STATES: dict[str, dict] = {}
 JOB_DIR = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "_pvtcopydl_tmp"
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SINGLE_FILE_BYTES = 1500 * 1024 * 1024  # 1.5 GB — safe under Telegram's 2GB limit + chunk count
 
 # User-account status edits are now reserved for milestones only (start,
 # crash, finish).  Live updates flow through the Bot.
@@ -1796,7 +1796,7 @@ async def handle_pvtcopydl(event):
             else:
                 log.warning("pvtcopydl DONE uploaded=0")
         else:
-            log.warning("pvtcopydl STOP key=%s tail=%d end=%d", job_key, tail_id, end_id)
+            log.warning("pvtcopydl STOP key=%s tail=%d end=%d", job_key, tail_id, end_msg_id)
     except Exception as e:
         log.warning("final status update failed: %s", e)
 
