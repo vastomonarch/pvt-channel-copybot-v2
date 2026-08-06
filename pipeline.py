@@ -386,6 +386,10 @@ async def upload_with_progress(
                 except Exception as exc:
                     log.debug("on_progress callback error: %s", exc)
 
+    # Telegram captions are capped at 1024 chars
+    if caption and len(caption) > 1024:
+        caption = caption[:1020] + "…"
+
     try:
         result = await client.send_file(
             entity=entity,

@@ -1080,6 +1080,8 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None, tc: Teleg
         )
 
         caption = msg.message or ""
+        if len(caption) > 1024:
+            caption = caption[:1020] + "…"
         media_list.append(tg_types.InputSingleMedia(
             fm,
             message=caption,
