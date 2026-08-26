@@ -225,6 +225,11 @@ All commands are **dot-prefixed** (userbot convention). Owner-only via `ME_ID` c
 - **Fix:** Added `tc = client` at start of `handle_pvtcopy()` and `handle_del()` handlers.
 - **File:** `bot.py`
 
+### Fix: `MessageMediaWebPage` error in `_classify` and `handle_pvtcopy`
+- **Problem:** Text messages with link previews (`MessageMediaWebPage`) caused `TypeError: Cannot use <MessageMediaWebPage> as file` when passed to `tc.send_file()`.
+- **Fix:** Updated `_classify()` to treat `MessageMediaWebPage`, `MessageMediaEmpty`, and `MessageMediaUnsupported` as text messages (when text is present) or service messages, and updated `handle_pvtcopy()` to dispatch message types via `_classify()`.
+- **File:** `bot.py`
+
 ---
 
 ## 11. Known limitations
