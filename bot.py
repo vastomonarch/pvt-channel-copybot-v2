@@ -45,6 +45,9 @@ from telethon.tl import types as tg_types
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
+    MessageMediaWebPage,
+    MessageMediaEmpty,
+    MessageMediaUnsupported,
     InputPeerChannel,
     DocumentAttributeVideo,
     DocumentAttributeFilename,
@@ -799,7 +802,10 @@ def _classify(msg) -> str:
         return "contact"
     if getattr(msg, "geo", None):
         return "location"
-    if getattr(msg, "media", None):
+    media = getattr(msg, "media", None)
+    if media:
+        if isinstance(media, (MessageMediaWebPage, MessageMediaEmpty, MessageMediaUnsupported)):
+            return "text" if getattr(msg, "message", None) else "service"
         return "media"
     return "text"
 
@@ -2164,19 +2170,33 @@ async def handle_pvtcopy(event):
             if msg is None:
                 skipped += 1
                 continue
-            if msg.media:
+            ctype = _classify(msg)
+            if ctype == "service":
+                skipped += 1
+                continue
+            elif ctype == "poll":
+                await _reupload_poll(msg, dst_entity, tc=tc)
+            elif ctype == "contact":
+                await _reupload_contact(msg, dst_entity, tc=tc)
+            elif ctype == "location":
+                await _reupload_location(msg, dst_entity, tc=tc)
+            elif ctype == "media":
                 await tc.send_file(
                     entity=dst_entity,
                     file=msg.media,
                     caption=msg.message or "",
                     formatting_entities=msg.entities,
                 )
-            elif msg.message:
-                await tc.send_message(
-                    entity=dst_entity,
-                    message=msg.message,
-                    formatting_entities=msg.entities,
-                )
+            elif ctype == "text":
+                if msg.message:
+                    await tc.send_message(
+                        entity=dst_entity,
+                        message=msg.message,
+                        formatting_entities=msg.entities,
+                    )
+                else:
+                    skipped += 1
+                    continue
             else:
                 skipped += 1
                 continue
