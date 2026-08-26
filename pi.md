@@ -220,6 +220,11 @@ All commands are **dot-prefixed** (userbot convention). Owner-only via `ME_ID` c
 - **Before:** Could loop indefinitely on some error paths
 - **After:** Clear `break` after 2 retry rounds; job stops with error message on persistent failure
 
+### Fix: `tc` NameError in `handle_pvtcopy` and `handle_del`
+- **Problem:** `src_entity = await tc.get_entity(...)` raised `NameError: name 'tc' is not defined` when executing `.pvtcopy` or `.del`.
+- **Fix:** Added `tc = client` at start of `handle_pvtcopy()` and `handle_del()` handlers.
+- **File:** `bot.py`
+
 ---
 
 ## 11. Known limitations
