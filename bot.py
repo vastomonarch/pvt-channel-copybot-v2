@@ -2096,6 +2096,7 @@ async def handle_pvtcopy(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
 
+    tc = client
     m = re.search(r"\.pvtcopy\s+(\S+)\s+(\S+)", event.message.text)
     if not m:
         await event.respond("invalid format.")
@@ -2248,6 +2249,8 @@ _DEL_BATCH_SIZE = 100
 async def handle_del(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: owner-only command
+
+    tc = client
     """Bulk-delete messages in an inclusive range.
 
     Usage:  .del <start_link> <end_link>
