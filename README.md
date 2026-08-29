@@ -26,7 +26,6 @@
 - **Download Pipeline** — Download → Upload → Verify with resumable checkpoints
 - **Bulk Delete** — Delete message ranges with a single command
 - **Live Progress** — Real-time file-level progress bars with speed, ETA, and spinners during both download AND upload phases
-- **Bot Integration** — Separate bot client for progress updates (keeps user account clean)
 - **Error Recovery** — Automatic retry on FloodWait, resumable after crashes
 - **Private Channels** — Works with private channels where forwarding is disabled
 - **Throttled Edits** — Progress messages update at most every 2s or on 2% change (Telegram-safe)
@@ -88,7 +87,6 @@
 
 - Python 3.10 or higher
 - Telegram API credentials ([get from my.telegram.org](https://my.telegram.org/apps))
-- A Telegram bot token (create via [@BotFather](https://t.me/BotFather))
 
 ### Installation
 
@@ -116,7 +114,6 @@ Edit `.env` with your credentials:
 ```env
 API_ID=12345678
 API_HASH=your_api_hash_here
-BOT_TOKEN=your_bot_token_here
 LOG_LEVEL=INFO
 ```
 
@@ -137,9 +134,9 @@ All commands use `.` (dot) prefix. The bot's `/start` uses slash (standard Teleg
 | `.help` | Show all available commands |
 | `.pvtcopy <start> <end>` | Server-side copy (strips forwarded-from) |
 | `.pvtcopydl <start> <end>` | Download → Upload pipeline with live progress |
-| `.pvtcopydlcancel [key]` | Cancel a running copy job |
+| `.cancel [key]` | Cancel a running copy job |
 | `.del <start_link> <end_link>` | Bulk-delete messages in range |
-| `.adest <channel_id>` | Add a destination channel |
+| `.adest <channel_id>` | Add destination or switch to existing one |
 | `.showdest` | View and select destination channels |
 | `.logout` | Disconnect and delete session |
 
@@ -202,9 +199,7 @@ pvt_channel_copybot_v2/
 
 ## 🔧 How It Works
 
-1. **Two Clients** — The bot runs two Telethon clients:
-   - **User Client** — Your Telegram account (handles copying/deleting)
-   - **Bot Client** — A separate bot for sending progress updates
+1. **Single Client** — The bot runs one Telethon client with your Telegram account for copying, downloading, and uploading.
 
 2. **Message Pipeline** — For `.pvtcopydl`:
    - Fetch messages from source
@@ -214,7 +209,7 @@ pvt_channel_copybot_v2/
    - Clean up temp files
    - Checkpoint after each message (resumable)
 
-3. **Progress Tracking** — Live file-level updates via the bot client:
+3. **Progress Tracking** — Live file-level updates in chat:
    - Unicode progress bar with spinner
    - Real-time bytes transferred / total bytes
    - Download/upload speed (smoothed rolling average)
@@ -237,9 +232,6 @@ pvt_channel_copybot_v2/
 
 ## ❓ FAQ
 
-**Q: Why two Telegram clients?**
-A: The bot client handles progress updates so your user account doesn't get spammed with message edits.
-
 **Q: Can I resume a crashed download?**
 A: Yes! `.pvtcopydl` checkpoints after each message. Re-issue the same command to resume.
 
@@ -260,7 +252,6 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 ## 🙏 Credits
 
 - [Telethon](https://docs.telethon.dev/) — Telegram client library
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) — Bot API wrapper (for progress rendering)
 
 ---
 

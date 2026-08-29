@@ -25,6 +25,7 @@ import random
 import hashlib
 import pathlib
 import logging
+import subprocess
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button, utils as tg_utils
@@ -149,16 +150,10 @@ _set_log_level(os.getenv("LOG_LEVEL", ""))
 
 API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 if not API_ID or not API_HASH:
     log.error("API_ID and API_HASH must be set in .env (see .env.example)")
     sys.exit(1)
-if not BOT_TOKEN:
-    log.warning(
-        "BOT_TOKEN not set in .env - live Bot progress DISABLED. "
-        "Add BOT_TOKEN=... to enable the progress bar + refresh button."
-    )
 
 # ===========================================================================
 # Display helpers
@@ -218,16 +213,8 @@ SESSION_NAME = str(pathlib.Path(__file__).resolve().parent / "copybot_session")
 # Primary user client
 client = TelegramClient(WALSession(SESSION_NAME), API_ID, API_HASH)
 
-# Second Telethon client acts as a Telegram *bot* driven by the BOT_TOKEN.
-BOT_SESSION_NAME = "copybot_bot_session"
-bot_client: TelegramClient | None = None
-if BOT_TOKEN:
-    bot_client = TelegramClient(WALSession(BOT_SESSION_NAME), API_ID, API_HASH)
-
-# Filled once both clients are ready (in main()).
+# Filled once client is ready (in main()).
 ME_ID: int | None = None
-BOT_USERNAME: str | None = None
-BOT_ID: int | None = None
 
 # ===========================================================================
 # Bot progress routing
@@ -528,6 +515,35 @@ def _extract_document_attrs(msg):
         thumb = max(all_thumbs, key=lambda t: getattr(t, "size", 0) or 0)
 
     return attrs, mime_type, supports_streaming, thumb
+
+
+def _extract_video_thumbnail(video_path: str, thumb_path: str) -> bool:
+    """Extract a thumbnail from a video using ffmpeg.
+    
+    Args:
+        video_path: Path to the video file
+        thumb_path: Path to save the thumbnail (JPEG)
+    
+    Returns:
+        True if thumbnail was extracted successfully, False otherwise
+    """
+    try:
+        # Use ffmpeg to extract a frame at 10% of the video duration
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-ss", "00:00:01",  # Skip first second (often black)
+            "-vframes", "1",
+            "-vf", "scale=320:-1",  # Scale to 320px width, maintain aspect ratio
+            "-q:v", "2",  # High quality JPEG
+            thumb_path
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and os.path.exists(thumb_path):
+            return True
+        return False
+    except Exception as e:
+        log.debug("ffmpeg thumbnail extraction failed: %s", e)
+        return False
 
 
 def _make_album_upload_progress_callback(state: dict, file_index: int, total_files: int):
@@ -1052,6 +1068,15 @@ async def _reupload_album(siblings_with_paths, dst_entity, state=None, tc: Teleg
             except Exception:
                 thumb_handle = None  # ponytail: skip thumb on failure
 
+        # Fallback: extract thumbnail from video if original failed
+        if not thumb_handle and orig_mime and orig_mime.startswith("video/") and path and os.path.exists(path):
+            thumb_tmp = f"_thumb_{idx}_{os.getpid()}.jpg"
+            if _extract_video_thumbnail(path, thumb_tmp):
+                try:
+                    thumb_handle = await tc.upload_file(thumb_tmp)
+                except Exception:
+                    thumb_handle = None
+
         # Determine nosound_video for videos
         nosound_video = None
         force_file = False
@@ -1402,6 +1427,13 @@ async def _loop_pvtcopydl(state: dict, src_entity, dst_entity, status_msg, tc: T
                         log.warning("thumb download failed msg=%d: %s", msg_id, e)
                         thumb_path = None
 
+                # Fallback: extract thumbnail from video if original failed
+                if not thumb_path and orig_mime and orig_mime.startswith("video/") and path and os.path.exists(path):
+                    thumb_path = f"_thumb_{msg_id}_{os.getpid()}.jpg"
+                    if not _extract_video_thumbnail(path, thumb_path):
+                        log.warning("ffmpeg thumbnail extraction failed for msg=%d", msg_id)
+                        thumb_path = None
+
                 # Ensure thumb file exists before upload
                 if thumb_path and not os.path.exists(thumb_path):
                     log.warning("thumb file missing before upload, skipping: %s", thumb_path)
@@ -1690,6 +1722,30 @@ async def handle_pvtcopydlcancel(event):
         listing = "\n".join(f"• {k}" for k in ACTIVE_DL_JOBS.keys())
         await event.respond(
             f"active .pvtcopydl jobs (cancel with `.pvtcopydlcancel <key>`):\n{listing}"
+        )
+        return
+    task = ACTIVE_DL_JOBS.get(key)
+    if task is None or task.done():
+        await event.respond(f"no running job with key `{key}` (already done or never started).")
+        return
+    task.cancel()
+    await event.respond(f"cancelling job `{key}`.")
+
+
+# .cancel — alias for .pvtcopydlcancel
+@client.on(events.NewMessage(pattern=r"\.cancel(?:\s+(\S+))?"))
+async def handle_cancel(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return
+    m = event.pattern_match
+    key = m.group(1) if m and m.lastindex else None
+    if not key:
+        if not ACTIVE_DL_JOBS:
+            await event.respond("no active jobs.")
+            return
+        listing = "\n".join(f"• {k}" for k in ACTIVE_DL_JOBS.keys())
+        await event.respond(
+            f"active jobs (cancel with `.cancel <key>`):\n{listing}"
         )
         return
     task = ACTIVE_DL_JOBS.get(key)
@@ -2043,11 +2099,6 @@ async def handle_logout(event):
     if os.path.exists(session_file):
         os.remove(session_file)
         log.info("session deleted: %s", session_file)
-    if bot_client is not None:
-        try:
-            await bot_client.disconnect()
-        except Exception:
-            pass
     os._exit(0)
 
 
@@ -2059,12 +2110,16 @@ async def handle_add_destination(event):
     full_id = f"-100{raw_id}"
     cfg = _load_config()
     if full_id in cfg["destinations"]:
-        await event.respond(f"{full_id} already in destination list.")
+        # Already exists — set as active
+        cfg["selected"] = full_id
+        _save_config(cfg)
+        await event.respond(f"destination {full_id} set as active.")
         return
     cfg["destinations"].append(full_id)
+    cfg["selected"] = full_id
     _save_config(cfg)
     await event.respond(
-        f"added destination {full_id}.\nuse .showdest to see all and pick active."
+        f"added & set destination {full_id} as active."
     )
 
 
@@ -2489,26 +2544,26 @@ async def handle_del(event):
 async def handle_help(event):
     if ME_ID and event.sender_id != ME_ID:
         return  # ponytail: only owner gets help
-    bot_friendly = f"@{BOT_USERNAME}" if BOT_USERNAME else "your Bot"
     await event.respond(
         "private channel copy bot — commands:\n\n"
         ".pvtcopy <start> <end>\n"
         "    server-side copy. works on channels where forwarding is allowed.\n"
         "    strips the forwarded-from tag.\n\n"
         ".pvtcopydl <start> <end>\n"
-        "    download → upload → verify → delete pipeline.\n"
+        "    download → upload → verify pipeline.\n"
         "    for channels where forwarding is disabled.\n"
-        f"    live progress (bar / eta / speed / refresh) appears in chat with {bot_friendly}.\n"
-        "    ETA derived from rolling per-item times.\n\n"
+        "    live progress (bar / eta / speed) appears in chat.\n\n"
         ".pvtcopydlcontinue <job_key>\n"
         "    resume an interrupted .pvtcopydl job from where it left off.\n\n"
-        ".pvtcopydlcancel <job_key>\n"
-        "    cancel a .pvtcopydl job.\n\n"
+        ".cancel [job_key]\n"
+        "    cancel a running job. no key = cancel latest.\n\n"
         ".del <start_link> <end_link>\n"
         "    bulk-delete messages in range (inclusive).\n"
         "    accepts public and private t.me links.\n\n"
         ".adest <channel_id>\n"
-        "    .showdest  — add or browse destination channels.\n\n"
+        "    add destination or switch to existing one.\n\n"
+        ".showdest\n"
+        "    view and select destination channels.\n\n"
         ".logout — disconnect.\n\n"
         ".help — this message."
     )
