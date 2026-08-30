@@ -213,8 +213,14 @@ SESSION_NAME = str(pathlib.Path(__file__).resolve().parent / "copybot_session")
 # Primary user client
 client = TelegramClient(WALSession(SESSION_NAME), API_ID, API_HASH)
 
+# Bot client (optional, for live progress updates)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+bot_client = TelegramClient("bot_session", API_ID, API_HASH) if BOT_TOKEN else None
+
 # Filled once client is ready (in main()).
 ME_ID: int | None = None
+BOT_USERNAME: str | None = None
+BOT_ID: int | None = None
 
 # ===========================================================================
 # Bot progress routing
