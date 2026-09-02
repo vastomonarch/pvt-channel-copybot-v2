@@ -12,7 +12,7 @@ A **Telethon userbot** that copies messages from private Telegram channels to de
 - **`.pvtcopy`** — Server-side copy (uses Telegram's native forward, strips "Forwarded from" tag). Only works when the source channel allows forwarding.
 - **`.pvtcopydl`** — Download → Upload pipeline. Works on channels where forwarding is disabled. Downloads each media file to disk, then re-uploads to the destination channel. This is the primary mode for restrictive channels.
 
-Additional commands: bulk delete (`.del`), destination management (`.adest`, `.showdest`), job resume (`.pvtcopydlcontinue`), job cancel (`.cancel`), logout (`.logout`).
+Additional commands: bulk delete (`.del`), destination management (`.adest`, `.showdest`), job resume (`.pvtcopydlcontinue`), job cancel (`.cancel`), logout (`.logout`), update (`.update`).
 
 ---
 
@@ -85,6 +85,7 @@ requirements.txt       telethon, python-dotenv, cryptg, aiohttp
 | `.adest <channel_id>` | Add destination or switch to existing one |
 | `.showdest` | View/select active destination |
 | `.logout` | Disconnect and delete session |
+| `.update` | Check for updates, pull changes, and restart if needed |
 | `.help` | Show commands |
 
 All commands are **dot-prefixed** (userbot convention). Owner-only via `ME_ID` check.

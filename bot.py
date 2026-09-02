@@ -2108,6 +2108,101 @@ async def handle_logout(event):
     os._exit(0)
 
 
+@client.on(events.NewMessage(pattern=r"\.update"))
+async def handle_update(event):
+    if ME_ID and event.sender_id != ME_ID:
+        return  # ponytail: owner-only command
+
+    status_msg = await event.respond("checking for updates...")
+
+    try:
+        # Fetch latest from remote
+        fetch_result = subprocess.run(
+            ["git", "fetch", "origin"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if fetch_result.returncode != 0:
+            await status_msg.edit(
+                f"git fetch failed:\n`{fetch_result.stderr.strip()[:200]}`"
+            )
+            return
+
+        # Compare local vs remote
+        local_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        remote_hash = subprocess.run(
+            ["git", "rev-parse", "origin/main"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+        if local_hash == remote_hash:
+            await status_msg.edit(
+                "bot is already up to date.\n"
+                f"current revision: `{local_hash[:8]}`"
+            )
+            return
+
+        # Get short log of what's new
+        log_result = subprocess.run(
+            ["git", "log", "--oneline", f"{local_hash}..{remote_hash}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        new_commits = log_result.stdout.strip()
+        commit_count = len(new_commits.splitlines())
+
+        await status_msg.edit(
+            f"update available — {commit_count} new commit(s).\n"
+            "pulling changes..."
+        )
+
+        # Pull update
+        pull_result = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if pull_result.returncode != 0:
+            await status_msg.edit(
+                f"git pull failed:\n`{pull_result.stderr.strip()[:200]}`"
+            )
+            return
+
+        # Install updated dependencies if requirements.txt changed
+        req_changed = subprocess.run(
+            ["git", "diff", "--name-only", f"{local_hash}", "HEAD",
+             "--", "requirements.txt"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+        if req_changed:
+            await status_msg.edit("requirements.txt changed — installing deps...")
+            pip_result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r",
+                 "requirements.txt", "-q"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if pip_result.returncode != 0:
+                await status_msg.edit(
+                    "pip install failed — restarting anyway.\n"
+                    f"`{pip_result.stderr.strip()[:200]}`"
+                )
+
+        await status_msg.edit(
+            "update complete. restarting bot..."
+        )
+        log.info("update applied: %s -> %s", local_hash[:8], remote_hash[:8])
+
+        # Restart by re-executing the script
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    except subprocess.TimeoutExpired:
+        await status_msg.edit("update timed out — try again later.")
+    except Exception as e:
+        log.exception("update failed: %s", e)
+        await status_msg.edit(f"update failed: `{e}`")
+
+
 @client.on(events.NewMessage(pattern=r"\.adest\s+(-?\d+)"))
 async def handle_add_destination(event):
     if ME_ID and event.sender_id != ME_ID:
@@ -2571,6 +2666,7 @@ async def handle_help(event):
         ".showdest\n"
         "    view and select destination channels.\n\n"
         ".logout — disconnect.\n\n"
+        ".update — check for updates, pull, and restart.\n\n"
         ".help — this message."
     )
 
