@@ -12,7 +12,7 @@ A **Telethon userbot** that copies messages from private Telegram channels to de
 - **`.pvtcopy`** — Server-side copy (uses Telegram's native forward, strips "Forwarded from" tag). Only works when the source channel allows forwarding.
 - **`.pvtcopydl`** — Download → Upload pipeline. Works on channels where forwarding is disabled. Downloads each media file to disk, then re-uploads to the destination channel. This is the primary mode for restrictive channels.
 
-Additional commands: bulk delete (`.del`), destination management (`.adest`, `.showdest`), job resume (`.pvtcopydlcontinue`), job cancel (`.cancel`), logout (`.logout`).
+Additional commands: bulk delete (`.del`), destination management (`.adest`, `.showdest`), job resume (`.pvtcopydlcontinue`), job cancel (`.cancel`), logout (`.logout`), update (`.update`).
 
 ---
 
@@ -27,8 +27,9 @@ trigger_pvtcopydl.py    Headless trigger for testing without Telegram client
 progress_ui/            Modular progress UI (spinner, bar, renderer, formatter)
 ```
 
-**Single client:**
-- **User client** (`client`) — Your Telegram account. Does all the actual copying, downloading, uploading. Progress updates appear directly in chat.
+**Dual clients:**
+- **User client** (`client`) — Your Telegram account. Does all the actual copying, downloading, uploading.
+- **Bot client** (`bot_client`) — Optional second client using `BOT_TOKEN`. Sends live progress dashboards (bar, ETA, speed, refresh/cancel buttons) to the user's bot chat, avoiding user-account edit spam.
 
 **Session management:** `WALSession` subclasses Telethon's `SQLiteSession` and enables WAL journal mode + `busy_timeout=10000` to prevent SQLite locking issues on overlayfs filesystems.
 
@@ -51,7 +52,7 @@ progress_ui/spinner.py    spinner animation
 config.json            runtime config (destinations)
 _pvtcopydl_tmp/        job dir: temp files, meta JSON
 config.example.json    template
-.env.example           template (API_ID, API_HASH)
+.env.example           template (API_ID, API_HASH, BOT_TOKEN)
 requirements.txt       telethon, python-dotenv, cryptg, aiohttp
 ```
 
@@ -61,6 +62,7 @@ requirements.txt       telethon, python-dotenv, cryptg, aiohttp
 
 **`.env` variables:**
 - `API_ID` / `API_HASH` — from my.telegram.org (required)
+- `BOT_TOKEN` — from @BotFather (optional, enables live progress in bot chat)
 - `DESTINATION` — fallback channel ID if config.json missing
 - `LOG_LEVEL` — override logging level (e.g. `DEBUG`)
 
@@ -83,6 +85,7 @@ requirements.txt       telethon, python-dotenv, cryptg, aiohttp
 | `.adest <channel_id>` | Add destination or switch to existing one |
 | `.showdest` | View/select active destination |
 | `.logout` | Disconnect and delete session |
+| `.update` | Check for updates, pull changes, and restart if needed |
 | `.help` | Show commands |
 
 All commands are **dot-prefixed** (userbot convention). Owner-only via `ME_ID` check.

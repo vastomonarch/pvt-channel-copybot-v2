@@ -114,6 +114,7 @@ Edit `.env` with your credentials:
 ```env
 API_ID=12345678
 API_HASH=your_api_hash_here
+BOT_TOKEN=your_bot_token_here  # Optional, for live progress updates
 LOG_LEVEL=INFO
 ```
 
