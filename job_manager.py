@@ -317,6 +317,15 @@ class JobManager:
         self._safe_state(job_key, JobState.PAUSED)
         return True
 
+    def request_resume(self, job_key: str) -> bool:
+        """Clear a pause on a job that is still running in this process."""
+        entry = self._running.get(job_key)
+        if entry is None:
+            return False
+        entry.control.pause.clear()
+        self._safe_state(job_key, JobState.RUNNING)
+        return True
+
     def resume(self, job_key: str) -> asyncio.Task:
         """Resume a paused/failed/queued job (after a restart too)."""
         rec = self.store.get_job(job_key)

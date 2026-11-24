@@ -1,582 +1,829 @@
-"""Optimized download/upload pipeline with aria2c and Telethon.
+"""The copy pipeline: one job's full lifecycle, TDLib-only.
 
-Architecture:
-- aria2c for fast parallel downloads with resume support
-- Telethon MTProto for uploads with progress callbacks
-- Single progress message that transitions between phases
-- Rate-limited updates (max every 2s or on significant change)
+Replaces the Telethon + aria2c pipeline.  Structure::
+
+    run(rec, control)
+      ├─ resolve source / destination chats
+      ├─ recover ambiguous "sending" markers (crash-mid-send safety)
+      ├─ iterate pending ids from the JobStore (never re-sends / re-skips)
+      │    ├─ server-side copy (forwardMessages send_copy=True), batched
+      │    └─ fallback per message: download → InputMessageContent → send
+      │         (semaphore-bounded; progress via updateFile watches)
+      └─ every outcome commits with the cursor in one transaction
+
+Key properties
+--------------
+* **Bounded concurrency**: download/upload semaphores are shared across all
+  jobs, so N running jobs can never exceed the configured parallelism.
+* **Cooperative cancellation**: ``control.check`` between messages,
+  ``control.pause`` honoured between messages, TDLib ``cancelDownloadFile``
+  for in-flight downloads.
+* **No busy loops**: waits are event waits / semaphore waits / sleeps with
+  backoff.
+* **Throttled progress**: one ``ThrottledProgress`` enforces the configured
+  edit interval; force-emits only on phase changes and completion.
+* **Error policy**: classify → flood-wait sleep, exponential backoff +
+  jitter for retryables, skip for unrecoverable messages, stop the job for
+  destination/permission failures (resumable via .pvtcopydlcontinue).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Awaitable, Callable
 
-from telethon import TelegramClient, Button
-from telethon.errors import (
-    FloodWaitError,
-    FileReferenceExpiredError,
-    MessageDeleteForbiddenError,
+from checkpoint import JobRecord, JobStore
+from config import Config
+from errors import ErrorKind, TdError, backoff_delay, classify
+from job_manager import JobControl
+from progress_ui import Spinner
+from progress_ui.renderer import render_copy_progress
+from tdlib_client import TDClient
+from tdlib_media import (
+    MediaGone,
+    UploadWatch,
+    build_input_content,
+    download_message_media,
+    download_source_thumbnail,
 )
-from telethon.tl import types as tg_types
-
-from progress_ui import Spinner, format_size, format_speed, format_time
-from progress_ui.renderer import (
-    box_bottom,
-    box_line,
-    box_separator,
-    box_top,
-    escape_html,
-    progress_bar,
+from tdlib_messages import (
+    caption_of,
+    classify as classify_message,
+    content_of,
+    copy_messages,
+    fetch_window,
+    get_messages,
+    media_name,
+    media_size,
+    resolve_chat,
+    send_album,
+    send_input,
 )
 
 log = logging.getLogger("copybot.pipeline")
 
-# ── Constants ────────────────────────────────────────────────────────
+__all__ = [
+    "CopyPipeline",
+    "ProgressSnapshot",
+    "ProgressSink",
+    "JobFailed",
+]
 
-JOB_DIR = Path(__file__).resolve().parent / "_downloads"
-JOB_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_SINGLE_FILE_BYTES = 1900 * 1024 * 1024  # ~1.9 GB — Telegram's hard cap is 2 GB; leave headroom for metadata/overhead
-ARIA2_RPC_SECRET = None  # Set if aria2c is configured with auth
-ARIA2_JSONRPC = "http://localhost:6800/jsonrpc"
-
-# Rate limiting for progress edits
-MIN_EDIT_INTERVAL = 2.0  # seconds
-MIN_EDIT_DELTA_PCT = 2.0  # only edit if percent changed by this much
+# Server-side copy batch size: TDLib forwardMessages is one RPC per batch;
+# smaller batches keep failure blast-radius and checkpoint granularity sane.
+COPY_BATCH = 50
 
 
-# ── Data Classes ─────────────────────────────────────────────────────
+class JobFailed(RuntimeError):
+    """Abort the job with a user-visible reason (state → failed, resumable)."""
 
+
+# ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
 @dataclass
-class TransferProgress:
-    """Tracks progress for a single download or upload operation."""
-
-    phase: str = "idle"  # idle, downloading, verifying, uploading, done, error
-    filename: str = ""
-    total_bytes: int = 0
-    transferred_bytes: int = 0
-    speed_bps: float = 0.0
-    eta_seconds: float = 0.0
-    elapsed_seconds: float = 0.0
-    start_time: float = field(default_factory=time.monotonic)
-    last_update: float = 0.0
-    last_pct: float = -1.0
-    error: str = ""
-
-    @property
-    def percent(self) -> float:
-        if self.total_bytes <= 0:
-            return 0.0
-        return min(100.0, (self.transferred_bytes / self.total_bytes) * 100)
-
-    @property
-    def should_update(self) -> bool:
-        """Check if enough time/progress has passed to warrant an edit."""
-        now = time.monotonic()
-        if now - self.last_update < MIN_EDIT_INTERVAL:
-            return False
-        if abs(self.percent - self.last_pct) < MIN_EDIT_DELTA_PCT:
-            return False
-        return True
-
-    def mark_updated(self) -> None:
-        self.last_update = time.monotonic()
-        self.last_pct = self.percent
-
-
-@dataclass
-class JobState:
-    """Complete state for a copy job."""
-
+class ProgressSnapshot:
     job_key: str
-    src_identifier: str | int
-    dst_identifier: str | int
-    start_msg_id: int
-    end_msg_id: int
-    current_msg_id: int
+    mode: str = "copy"            # copy | downloading | uploading
+    current_msg: int = 0
+    total: int = 0
     downloaded: int = 0
     uploaded: int = 0
     skipped: int = 0
     errors: int = 0
-    started_at: float = field(default_factory=time.time)
-    download: TransferProgress = field(default_factory=TransferProgress)
-    upload: TransferProgress = field(default_factory=TransferProgress)
-    spinner: Spinner = field(default_factory=Spinner)
+    speed: float = 0.0            # bytes/s for the active transfer
+    eta: float = 0.0
+    elapsed: float = 0.0
+    filename: str = ""
+    file_current: int = 0
+    file_total: int = 0
+    start_msg: int = 0
 
-    @property
-    def total(self) -> int:
-        return self.end_msg_id - self.start_msg_id + 1
-
-    @property
-    def progress_pct(self) -> float:
-        done = max(0, self.current_msg_id - self.start_msg_id)
-        return (done / max(1, self.total)) * 100
-
-
-# ── Progress Renderer ────────────────────────────────────────────────
-
-def render_job_progress(state: JobState) -> str:
-    """Render the combined download/upload progress dashboard."""
-    spin = state.spinner.next()
-    dl = state.download
-    ul = state.upload
-
-    # Determine active phase
-    if dl.phase == "downloading":
-        header = f"{spin} 📥 Downloading"
-        bar = progress_bar(dl.percent, width=20)
-        pct_str = f"{dl.percent:.1f}%"
-        size_line = f"{format_size(dl.transferred_bytes)} / {format_size(dl.total_bytes)}"
-        speed_line = format_speed(dl.speed_bps) if dl.speed_bps > 0 else "—"
-        eta_line = format_time(dl.eta_seconds) if dl.eta_seconds > 0 else "—"
-    elif ul.phase == "uploading":
-        header = f"{spin} 📤 Uploading"
-        bar = progress_bar(ul.percent, width=20)
-        pct_str = f"{ul.percent:.1f}%"
-        size_line = f"{format_size(ul.transferred_bytes)} / {format_size(ul.total_bytes)}"
-        speed_line = format_speed(ul.speed_bps) if ul.speed_bps > 0 else "—"
-        eta_line = format_time(ul.eta_seconds) if ul.eta_seconds > 0 else "—"
-    elif dl.phase == "done" and ul.phase == "done":
-        header = "✅ Upload completed successfully"
-        bar = progress_bar(100.0, width=20)
-        pct_str = "100%"
-        size_line = format_size(ul.total_bytes)
-        speed_line = format_speed(ul.total_bytes / max(ul.elapsed_seconds, 0.01))
-        eta_line = format_time(ul.elapsed_seconds)
-    elif dl.phase == "error" or ul.phase == "error":
-        header = f"❌ {dl.error or ul.error or 'Transfer failed'}"
-        bar = progress_bar(dl.percent or ul.percent, width=20)
-        pct_str = f"{dl.percent or ul.percent:.1f}%"
-        size_line = "—"
-        speed_line = "—"
-        eta_line = "—"
-    else:
-        # Processing/idle
-        header = f"{spin} ⏳ Processing"
-        bar = progress_bar(state.progress_pct, width=20)
-        pct_str = f"{state.progress_pct:.1f}%"
-        size_line = f"msg {state.current_msg_id} / {state.end_msg_id}"
-        speed_line = "—"
-        eta_line = "—"
-
-    # Filename (truncate if long)
-    fname = dl.filename or ul.filename or ""
-    if len(fname) > 28:
-        fname = fname[:25] + "..."
-
-    lines = [
-        box_top(34),
-        box_line(header, 34),
-        box_line(f"📄 {fname}" if fname else f"📄 msg {state.current_msg_id}", 34),
-        box_separator(34),
-        box_line(f"{bar}  {pct_str}", 34),
-        box_line("", 34),
-        box_line(f"📦  {size_line}", 34),
-        box_line(f"⚡  {speed_line}", 34),
-        box_line(f"⏳  ETA      {eta_line}", 34),
-        box_separator(34),
-        box_line(f"DL: {state.downloaded} · UL: {state.uploaded} · skip: {state.skipped}", 34),
-        box_bottom(34),
-    ]
-
-    body = escape_html("\n".join(lines))
-    return f"<pre>{body}</pre>"
-
-
-def render_job_buttons(job_key: str) -> list[list[Button]]:
-    """Inline buttons for job progress."""
-    return [
-        [
-            Button.inline("🔄 Refresh", data=f"refresh:{job_key}".encode()),
-            Button.inline("⏹ Cancel", data=f"cancel:{job_key}".encode()),
-        ]
-    ]
-
-
-# ── Aria2c Integration ──────────────────────────────────────────────
-
-class Aria2cDownloader:
-    """Async wrapper around aria2c for fast parallel downloads."""
-
-    def __init__(self, rpc_url: str = ARIA2_JSONRPC, secret: str | None = None):
-        self.rpc_url = rpc_url
-        self.secret = secret
-
-    async def _rpc_call(self, method: str, params: list | None = None) -> Any:
-        """Make an RPC call to aria2c."""
-        import aiohttp
-
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "copybot",
-            "method": method,
-            "params": params or [],
-        }
-        if self.secret:
-            payload["params"].insert(0, f"token:{self.secret}")
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                data = await resp.json()
-                if "error" in data:
-                    raise RuntimeError(f"aria2c RPC error: {data['error']}")
-                return data.get("result")
-
-    async def download(
-        self,
-        url: str,
-        output_path: str,
-        progress_callback: Callable[[int, int], Any] | None = None,
-    ) -> str | None:
-        """Download a file using aria2c with resume support.
-
-        Returns the output path on success, None on failure.
-        """
-        try:
-            options = {
-                "dir": str(Path(output_path).parent),
-                "out": Path(output_path).name,
-                "continue": "true",
-                "auto-file-renaming": "false",
-                "allow-overwrite": "true",
-            }
-
-            # Add the download
-            result = await self._rpc_call("aria2.addUri", [[url], options])
-            gid = result
-
-            # Poll for completion
-            while True:
-                status = await self._rpc_call("aria2.tellStatus", [gid])
-                state = status.get("status", "")
-
-                if state == "complete":
-                    return output_path
-                elif state == "error":
-                    error_code = status.get("errorCode", "?")
-                    error_msg = status.get("errorMessage", "unknown")
-                    log.error("aria2c download failed: %s - %s", error_code, error_msg)
-                    return None
-                elif state == "removed":
-                    log.warning("aria2c download removed: %s", gid)
-                    return None
-
-                # Report progress
-                if progress_callback:
-                    completed = int(status.get("completedLength", 0))
-                    total = int(status.get("totalLength", 0))
-                    speed = int(status.get("downloadSpeed", 0))
-                    try:
-                        result = progress_callback(completed, total)
-                        if asyncio.iscoroutine(result):
-                            await result
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(0.5)
-
-        except Exception as e:
-            log.error("aria2c download error: %s", e)
-            return None
-
-    async def get_status(self, gid: str) -> dict | None:
-        """Get download status."""
-        try:
-            return await self._rpc_call("aria2.tellStatus", [gid])
-        except Exception:
-            return None
-
-    async def pause(self, gid: str) -> bool:
-        """Pause a download."""
-        try:
-            await self._rpc_call("aria2.pause", [gid])
-            return True
-        except Exception:
-            return False
-
-    async def unpause(self, gid: str) -> bool:
-        """Resume a paused download."""
-        try:
-            await self._rpc_call("aria2.unpause", [gid])
-            return True
-        except Exception:
-            return False
-
-    async def remove(self, gid: str) -> bool:
-        """Remove a download."""
-        try:
-            await self._rpc_call("aria2.remove", [gid])
-            return True
-        except Exception:
-            return False
-
-
-# ── Telethon Upload with Progress ────────────────────────────────────
-
-async def upload_with_progress(
-    client: TelegramClient,
-    entity: Any,
-    file_path: str,
-    progress: TransferProgress,
-    caption: str | None = None,
-    formatting_entities: list | None = None,
-    attributes: list | None = None,
-    mime_type: str | None = None,
-    supports_streaming: bool = False,
-    force_document: bool = False,
-    thumb: str | None = None,
-    on_progress: Callable[[TransferProgress], Any] | None = None,
-) -> Any:
-    """Upload a file using Telethon with progress tracking.
-
-    Args:
-        on_progress: Optional async callback invoked on each significant
-            progress tick.  Used by the caller to edit a Telegram message.
-
-    Returns the sent message on success, None on failure.
-    """
-    if not os.path.exists(file_path):
-        log.error("upload file not found: %s", file_path)
-        return None
-
-    file_size = os.path.getsize(file_path)
-    progress.phase = "uploading"
-    progress.total_bytes = file_size
-    progress.transferred_bytes = 0
-    progress.start_time = time.monotonic()
-    progress.last_update = 0
-    progress.last_pct = -1
-
-    last_bytes = 0
-    last_time = time.monotonic()
-    _notify_handle = [None]  # mutable container for closure
-
-    async def _progress_cb(current: int, total: int) -> None:
-        nonlocal last_bytes, last_time
-        now = time.monotonic()
-        dt = now - last_time
-
-        # Always update the dataclass so callers see fresh numbers
-        progress.transferred_bytes = current
-        progress.total_bytes = total
-
-        if dt > 0.3 and current > last_bytes:
-            speed = (current - last_bytes) / dt
-            progress.speed_bps = speed * 0.3 + progress.speed_bps * 0.7
-            remaining = total - current
-            progress.eta_seconds = remaining / progress.speed_bps if progress.speed_bps > 0 else 0
-            progress.elapsed_seconds = now - progress.start_time
-            last_bytes = current
-            last_time = now
-            # Throttled notification to caller (every ~2 s or 2% change)
-            if on_progress and progress.should_update:
-                progress.mark_updated()
-                try:
-                    result = on_progress(progress)
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as exc:
-                    log.debug("on_progress callback error: %s", exc)
-
-    # Telegram captions are capped at 1024 chars
-    if caption and len(caption) > 1024:
-        caption = caption[:1020] + "…"
-
-    try:
-        result = await client.send_file(
-            entity=entity,
-            file=file_path,
-            caption=caption,
-            formatting_entities=formatting_entities,
-            attributes=attributes,
-            mime_type=mime_type,
-            supports_streaming=supports_streaming,
-            force_document=force_document,
-            thumb=thumb,
-            progress_callback=_progress_cb,
+    def render(self, spinner: Spinner) -> str:
+        return render_copy_progress(
+            spinner=spinner,
+            mode=self.mode,
+            job_key=self.job_key,
+            current_msg=self.current_msg,
+            total=self.total,
+            downloaded=self.downloaded,
+            uploaded=self.uploaded,
+            skipped=self.skipped,
+            errors=self.errors,
+            speed=self.speed,
+            eta=self.eta,
+            elapsed=self.elapsed,
+            filename=self.filename,
+            file_current=self.file_current,
+            file_total=self.file_total,
+            start_msg=self.start_msg,
         )
 
-        # Mark complete
-        progress.transferred_bytes = file_size
-        progress.elapsed_seconds = time.monotonic() - progress.start_time
-        if progress.elapsed_seconds > 0:
-            progress.speed_bps = file_size / progress.elapsed_seconds
-        progress.phase = "done"
-        # Final notification
-        if on_progress:
-            try:
-                result2 = on_progress(progress)
-                if asyncio.iscoroutine(result2):
-                    await result2
-            except Exception:
-                pass
 
-        return result
-
-    except FloodWaitError:
-        raise
-    except Exception as e:
-        log.error("upload failed: %s", e)
-        progress.phase = "error"
-        progress.error = str(e)
-        return None
+ProgressSink = Callable[[ProgressSnapshot], Awaitable[None]]
 
 
-# ── Download with Progress (Telethon fallback) ──────────────────────
+class ThrottledProgress:
+    """Wraps a sink, enforcing ``progress_edit_interval`` unless forced."""
 
-async def download_with_progress(
-    client: TelegramClient,
-    msg: Any,
-    output_dir: str,
-    progress: TransferProgress,
-    src_entity: Any = None,
-    retries: int = 2,
-    on_progress: Callable[[TransferProgress], Any] | None = None,
-) -> tuple[str | None, int, float]:
-    """Download media from a message with progress tracking.
+    def __init__(self, sink: ProgressSink | None, interval: float):
+        self._sink = sink
+        self._interval = max(0.0, interval)
+        self._last = 0.0
 
-    Args:
-        on_progress: Optional async callback invoked on each significant
-            progress tick.  Used by the caller to edit a Telegram message.
-
-    Returns (path, size_bytes, elapsed_seconds).
-    """
-    progress.phase = "downloading"
-    progress.filename = ""
-    progress.transferred_bytes = 0
-    progress.start_time = time.monotonic()
-    progress.last_update = 0
-    progress.last_pct = -1
-
-    # Get filename from media
-    media = getattr(msg, "media", None)
-    doc = getattr(media, "document", None) if media else None
-    if doc:
-        for attr in getattr(doc, "attributes", []):
-            if hasattr(attr, "file_name"):
-                progress.filename = attr.file_name
-                break
-    if not progress.filename:
-        progress.filename = f"msg_{msg.id}"
-
-    # Get total size
-    if doc:
-        progress.total_bytes = getattr(doc, "size", 0) or 0
-    else:
-        photo = getattr(media, "photo", None) if media else None
-        if photo:
-            sizes = getattr(photo, "sizes", None) or []
-            for s in sizes:
-                sz = getattr(s, "size", None)
-                if sz:
-                    progress.total_bytes = max(progress.total_bytes, int(sz))
-
-    last_bytes = 0
-    last_time = time.monotonic()
-
-    async def _progress_cb(current: int, total: int) -> None:
-        nonlocal last_bytes, last_time
+    async def emit(self, snap: ProgressSnapshot, *, force: bool = False) -> None:
+        if self._sink is None:
+            return
         now = time.monotonic()
-        dt = now - last_time
-
-        # Always update the dataclass
-        progress.transferred_bytes = current
-        if total > 0:
-            progress.total_bytes = total
-
-        if dt > 0.3 and current > last_bytes:
-            speed = (current - last_bytes) / dt
-            progress.speed_bps = speed * 0.3 + progress.speed_bps * 0.7
-            remaining = total - current
-            if progress.speed_bps > 0:
-                progress.eta_seconds = remaining / progress.speed_bps
-            progress.elapsed_seconds = now - progress.start_time
-            last_bytes = current
-            last_time = now
-            # Throttled notification to caller
-            if on_progress and progress.should_update:
-                progress.mark_updated()
-                try:
-                    result = on_progress(progress)
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as exc:
-                    log.debug("on_progress callback error: %s", exc)
-
-    fresh = msg
-    last_err = None
-
-    for attempt in range(retries + 1):
+        if not force and (now - self._last) < self._interval:
+            return
+        self._last = now
         try:
-            t0 = time.monotonic()
-            path = await client.download_media(
-                fresh,
-                file=str(output_dir) + "/",
-                progress_callback=_progress_cb,
-            )
-            elapsed = time.monotonic() - t0
+            await self._sink(snap)
+        except Exception:
+            # Progress must never kill a job (e.g. FloodWait on edits)
+            log.debug("progress sink failed", exc_info=True)
 
-            if path:
-                actual = os.path.getsize(path) if os.path.exists(path) else 0
-                progress.transferred_bytes = actual
-                progress.elapsed_seconds = elapsed
-                if elapsed > 0:
-                    progress.speed_bps = actual / elapsed
-                progress.phase = "done"
-                return path, actual, elapsed
 
-            return None, 0, 0.0
+@dataclass
+class _SpeedWindow:
+    """Rolling (t, bytes) samples → bytes/s over the last ~8 s."""
+    samples: list[tuple[float, float]] = field(default_factory=list)
+    window: float = 8.0
 
-        except FileReferenceExpiredError:
+    def add(self, transferred: int) -> None:
+        now = time.monotonic()
+        self.samples.append((now, float(transferred)))
+        cutoff = now - self.window
+        while len(self.samples) > 2 and self.samples[0][0] < cutoff:
+            self.samples.pop(0)
+
+    def speed(self) -> float:
+        if len(self.samples) < 2:
+            return 0.0
+        t0, b0 = self.samples[0]
+        t1, b1 = self.samples[-1]
+        if t1 <= t0:
+            return 0.0
+        return max(0.0, (b1 - b0) / (t1 - t0))
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+class CopyPipeline:
+    """Executes one :class:`JobRecord` against the TDLib clients."""
+
+    def __init__(self, cfg: Config, store: JobStore,
+                 user: TDClient, bot: TDClient | None, *,
+                 dl_sem: asyncio.Semaphore, ul_sem: asyncio.Semaphore,
+                 progress: ProgressSink | None = None,
+                 staging_dir: Path | None = None,
+                 rng: random.Random | None = None):
+        self.cfg = cfg
+        self.store = store
+        self.user = user
+        self.bot = bot
+        self.dl_sem = dl_sem
+        self.ul_sem = ul_sem
+        self.progress = ThrottledProgress(progress, cfg.progress_edit_interval)
+        self.staging = Path(staging_dir or cfg.staging_dir)
+        self.rng = rng or random.Random()
+        self.spinner = Spinner()
+        # ids that exhausted retries during THIS run: excluded from pending
+        # so the loop can't spin on them; their 'failed' markers are cleared
+        # by reset_failed() at the start of the next run (.pvtcopydlcontinue)
+        self._run_failed: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # entry point
+    # ------------------------------------------------------------------
+    async def run(self, rec: JobRecord, control: JobControl) -> None:
+        start = time.monotonic()
+        src_id = _parse_identifier(rec.src)
+        dst_id = _parse_identifier(rec.dst)
+        try:
+            src_chat = await resolve_chat(self.user, src_id)
+            dst_chat = await resolve_chat(self.user, dst_id)
+        except TdError as exc:
+            raise JobFailed(
+                f"cannot resolve chats: [{exc.code}] {exc.message}") from exc
+        if src_chat == dst_chat:
+            raise JobFailed("source and destination are the same chat")
+
+        log.info("job %s: copy %d..%d (%d messages) src=%s dst=%s",
+                 rec.job_key, rec.start_msg_id, rec.end_msg_id, rec.total,
+                 src_chat, dst_chat)
+
+        # a prior run stopped at a failure point — retry those ids now
+        cleared = self.store.reset_failed(rec.job_key)
+        if cleared:
+            log.info("job %s: retrying %d previously failed message(s)",
+                     rec.job_key, cleared)
+
+        await self._recover_ambiguous(rec, src_chat, dst_chat)
+        await self._loop(rec, control, src_chat, dst_chat, start)
+
+    # ------------------------------------------------------------------
+    # crash-recovery of "sending" markers
+    # ------------------------------------------------------------------
+    async def _recover_ambiguous(self, rec: JobRecord, src_chat: int,
+                                 dst_chat: int) -> None:
+        """Resolve messages that were in-flight when a previous run died.
+
+        Ordering rule: sends are sequential inside a job, so if a *later*
+        message is already marked ``sent``, the ambiguous one completed too.
+        Otherwise scan the destination's recent messages for a content match
+        (caption/text equality): a match means it was sent; no match means it
+        never reached Telegram → drop the marker so it is re-processed.
+        """
+        ambiguous = self.store.ambiguous_messages(rec.job_key)
+        if not ambiguous:
+            return
+        log.info("job %s: recovering %d ambiguous message(s): %s",
+                 rec.job_key, len(ambiguous), ambiguous)
+        later_sent = self.store.processed_ids(rec.job_key, "sent")
+        dest_texts = await self._recent_dest_texts(dst_chat)
+        for mid in ambiguous:
+            if any(s > mid for s in later_sent):
+                self.store.resolve_ambiguous(
+                    rec.job_key, mid, "sent", detail="ordering recovery")
+                log.info("msg %d: recovered as sent (ordering)", mid)
+                continue
+            matched = await self._match_destination(rec, mid, src_chat,
+                                                    dest_texts)
+            if matched:
+                self.store.resolve_ambiguous(
+                    rec.job_key, mid, "sent", detail="content match")
+                log.info("msg %d: recovered as sent (content match)", mid)
+            else:
+                self.store.unmark(rec.job_key, mid)
+                log.info("msg %d: not found in destination — will re-send",
+                         mid)
+
+    async def _recent_dest_texts(self, dst_chat: int) -> list[str]:
+        try:
+            res = await self.user.request({
+                "@type": "getChatHistory", "chat_id": dst_chat,
+                "from_message_id": 0, "offset": 0, "limit": 40,
+                "only_local": False,
+            })
+        except Exception:
+            log.debug("fetching destination history failed", exc_info=True)
+            return []
+        out: list[str] = []
+        for dm in res.get("messages") or []:
+            text, _ = caption_of(content_of(dm))
+            if text:
+                out.append(text)
+        return out
+
+    async def _match_destination(self, rec: JobRecord, mid: int,
+                                 src_chat: int,
+                                 dest_texts: list[str]) -> bool:
+        if not dest_texts:
+            return False
+        try:
+            msgs = await get_messages(self.user, src_chat, [mid])
+            src_msg = msgs.get(mid)
+            if src_msg is None:
+                return False
+            text, _ = caption_of(content_of(src_msg))
+            return bool(text) and text in dest_texts
+        except Exception:
+            log.debug("source fetch for match failed (msg %d)", mid,
+                      exc_info=True)
+            return False
+
+    # ------------------------------------------------------------------
+    # main loop
+    # ------------------------------------------------------------------
+    async def _loop(self, rec: JobRecord, control: JobControl,
+                    src_chat: int, dst_chat: int, start: float) -> None:
+        while True:
+            if control.cancelled:
+                raise asyncio.CancelledError
+            if control.pause.is_set():
+                self._store_state(rec, "paused")
+                while control.pause.is_set() and not control.cancelled:
+                    await asyncio.sleep(0.25)
+                if control.cancelled:
+                    raise asyncio.CancelledError
+                self._store_state(rec, "running")
+
+            pending = [m for m in self.store.iter_range(
+                rec.job_key, rec.start_msg_id, rec.end_msg_id)
+                if m not in self._run_failed]
+            if not pending:
+                break
+
+            # --- server-side copy fast path (batched) -------------------
+            batch = pending[:COPY_BATCH]
+            fully = await self._try_server_copy(
+                rec, control, src_chat, dst_chat, batch, start)
+            if fully:
+                await self.progress.emit(self._snapshot(rec, start))
+                continue
+            if control.cancelled:
+                raise asyncio.CancelledError
+
+            # --- per-message fallback (download + re-upload) ------------
+            msg_id = pending[0]
+            await self._process_one(
+                rec, control, src_chat, dst_chat, msg_id, start)
+
+            await self.progress.emit(self._snapshot(rec, start))
+            # gentle pacing to stay under Telegram's rate envelope
+            await asyncio.sleep(self.rng.uniform(0.05, 0.15))
+
+        self._store_state(rec, "completed")
+        await self.progress.emit(self._snapshot(rec, start), force=True)
+
+    def _store_state(self, rec: JobRecord, state: str) -> None:
+        try:
+            self.store.set_state(rec.job_key, state)
+            rec.state = state
+        except (ValueError, KeyError) as exc:
+            log.debug("state change to %s rejected: %s", state, exc)
+
+    # ------------------------------------------------------------------
+    # server-side copy
+    # ------------------------------------------------------------------
+    async def _try_server_copy(self, rec: JobRecord, control: JobControl,
+                               src_chat: int, dst_chat: int,
+                               batch: list[int], start: float) -> bool:
+        """Try a batched server-side copy (no download/upload at all).
+
+        Returns True if the batch was fully resolved.  Returns False when
+        the caller should process ``batch[0]`` via the per-message path
+        (batch copy is unavailable for these messages).  Flood waits are
+        absorbed here; retryable errors get bounded backoff before falling
+        back.
+        """
+        # Cheap local checks first: a batch containing service messages or
+        # missing ids would make forwardMessages fail wholesale.
+        msgs = await get_messages(self.user, src_chat, batch)
+        resolvable: list[int] = []
+        skipped: dict[int, tuple[str, str]] = {}
+        for mid in batch:
+            m = msgs.get(mid)
+            if m is None:
+                skipped[mid] = ("skipped", "message not found")
+            elif classify_message(m) == "service":
+                skipped[mid] = ("skipped", "service message")
+            else:
+                resolvable.append(mid)
+
+        if skipped:
+            self.store.begin_chunk(rec.job_key, list(skipped))
+            self.store.finish_chunk(rec.job_key, skipped)
+            for mid in sorted(skipped):
+                log.info("msg %d: skipped (%s)", mid, skipped[mid][1])
+        if not resolvable:
+            return True
+
+        self.store.begin_chunk(rec.job_key, resolvable)
+        attempt = 0
+        while True:
+            if control.cancelled:
+                raise asyncio.CancelledError
             try:
-                lookup = src_entity if src_entity is not None else fresh.peer_id
-                fresh_list = await client.get_messages(lookup, ids=fresh.id)
-                fresh = fresh_list[0] if isinstance(fresh_list, list) else fresh_list
-                if fresh is None:
-                    return None, 0, 0.0
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(3)
-        except FloodWaitError:
-            raise
-        except (ConnectionError, asyncio.TimeoutError) as e:
-            last_err = e
-            await asyncio.sleep(5)
-        except Exception as e:
-            log.warning("download_media raised %s for msg=%d", e, msg.id)
-            last_err = e
-            break
+                sent = await copy_messages(
+                    self.user, src_chat, dst_chat, resolvable,
+                    timeout=self.cfg.send_timeout)
+                if len(sent) != len(resolvable):
+                    log.warning("server copy returned %d/%d messages",
+                                len(sent), len(resolvable))
+                self.store.finish_chunk(rec.job_key, {
+                    mid: ("sent", "server copy") for mid in resolvable})
+                for mid in resolvable:
+                    log.info("COPY msg=%d → server-side", mid)
+                await self.progress.emit(
+                    self._snapshot(rec, start, mode="copy"), force=True)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                info = classify(exc)
+                if info.kind is ErrorKind.FLOOD_WAIT:
+                    log.warning("server copy flood-wait %.0fs (msg %s)",
+                                info.wait_seconds, resolvable[:3])
+                    self._bump(rec, flood_waits=1)
+                    await asyncio.sleep(info.wait_seconds)
+                    continue
+                if info.retryable and attempt < self.cfg.retry_count:
+                    attempt += 1
+                    delay = backoff_delay(attempt, rng=self.rng)
+                    log.info("server copy retry %d/%d in %.1fs (%s)",
+                             attempt, self.cfg.retry_count, delay, info)
+                    self._bump(rec, retries=1)
+                    await asyncio.sleep(delay)
+                    continue
+                # Not copyable as a batch → per-message fallback.
+                # Un-mark the batch first: these ids must stay *pending*
+                # (not 'sending') so the fallback loop can process them.
+                for mid in resolvable:
+                    self.store.unmark(rec.job_key, mid)
+                log.info("server copy unavailable (%s); falling back for "
+                         "%d message(s)", info, len(resolvable))
+                return False
 
-    log.warning("download failed msg=%d attempts=%d err=%s", msg.id, retries + 1, last_err)
-    progress.phase = "error"
-    progress.error = str(last_err) if last_err else "download failed"
-    return None, 0, 0.0
+    # ------------------------------------------------------------------
+    # per-message processing (server-copy fallback)
+    # ------------------------------------------------------------------
+    async def _process_one(self, rec: JobRecord, control: JobControl,
+                           src_chat: int, dst_chat: int, msg_id: int,
+                           start: float) -> None:
+        fetched = await fetch_window(
+            self.user, src_chat, msg_id,
+            rec.start_msg_id, rec.end_msg_id, self.cfg.album_window)
+        cur = fetched.get(msg_id)
+        if cur is None:
+            self._resolve(rec, msg_id, "skipped", "message not found")
+            log.info("MSG NOT FOUND msg=%d - skipping", msg_id)
+            return
+
+        kind = classify_message(cur)
+        if kind == "service":
+            self._resolve(rec, msg_id, "skipped", "service message")
+            return
+
+        album_id = cur.get("media_album_id") or 0
+        if album_id and kind == "media":
+            await self._process_album(
+                rec, control, src_chat, dst_chat, msg_id, fetched,
+                int(album_id), start)
+            return
+
+        if kind in ("text", "poll", "contact", "location"):
+            await self._process_simple(rec, control, src_chat, dst_chat,
+                                       msg_id, cur, start)
+            return
+
+        if kind == "media":
+            await self._process_media(
+                rec, control, src_chat, dst_chat, msg_id, cur, start)
+            return
+
+        self._resolve(rec, msg_id, "skipped", f"unhandled content ({kind})")
+
+    # -- text / poll / contact / location --------------------------------
+    async def _process_simple(self, rec: JobRecord, control: JobControl,
+                              src_chat: int, dst_chat: int, msg_id: int,
+                              msg: dict, start: float) -> None:
+        """Send a non-media message via input content (one bounded retry
+        loop; the server-copy batch already failed for this id)."""
+        content = build_input_content(msg)
+        await self._send_with_retry(rec, control, dst_chat, msg_id, content,
+                                    start)
+
+    # -- media ------------------------------------------------------------
+    async def _process_media(self, rec: JobRecord, control: JobControl,
+                             src_chat: int, dst_chat: int, msg_id: int,
+                             msg: dict, start: float) -> None:
+        cfg = self.cfg
+        content = content_of(msg)
+        name = media_name(content) or f"msg_{msg_id}"
+        staging = self.staging / rec.job_key / f"msg_{msg_id}"
+        self.store.begin_chunk(rec.job_key, [msg_id])
+
+        # ── download (bounded) ───────────────────────────────────────
+        speedwin = _SpeedWindow()
+        snap = self._snapshot(rec, start, mode="downloading", filename=name)
+
+        def on_dl(done: int, total: int) -> None:
+            speedwin.add(done)
+            snap.file_current = done
+            snap.file_total = total
+            snap.speed = speedwin.speed()
+
+        async with self.dl_sem:
+            if control.cancelled:
+                raise asyncio.CancelledError
+            try:
+                path, actual, _elapsed = await download_message_media(
+                    self.user, msg, src_chat, staging,
+                    on_progress=on_dl,
+                    stall_timeout=cfg.download_stall_timeout)
+            except MediaGone as exc:
+                self._resolve(rec, msg_id, "skipped", f"media gone: {exc}")
+                log.info("msg %d: media gone (%s) — skipped", msg_id, exc)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._item_error(rec, msg_id, exc,
+                                       context=f"download msg={msg_id}")
+                return
+        await self.progress.emit(snap, force=True)
+
+        # ── thumbnail (best effort) ──────────────────────────────────
+        thumb = await download_source_thumbnail(
+            self.user, content, staging, msg_id)
+
+        # ── split if above Telegram's single-file cap ────────────────
+        parts = [path]
+        try:
+            if os.path.getsize(path) > cfg.max_single_file_bytes:
+                parts = await asyncio.to_thread(
+                    _split_large, path, cfg.max_single_file_bytes)
+                if len(parts) > 1:
+                    log.info("split %s → %d parts", name, len(parts))
+        except OSError as exc:
+            self._resolve(rec, msg_id, "failed", f"stat failed: {exc}")
+            raise JobFailed(f"msg {msg_id}: cannot stat download: {exc}") from exc
+
+        # ── upload (bounded), one send per part ──────────────────────
+        base_caption, base_entities = caption_of(content)
+        for idx, part in enumerate(parts):
+            if control.cancelled:
+                raise asyncio.CancelledError
+            caption = base_caption
+            entities = base_entities
+            if len(parts) > 1:
+                caption = (base_caption + "\n\n"
+                           f"📦 Part {idx + 1}/{len(parts)}").strip()
+                entities = [] if idx > 0 else base_entities
+            try:
+                await self._upload_part(
+                    rec, control, dst_chat, msg, part, caption, entities,
+                    thumb if idx == 0 else None, start)
+            except asyncio.CancelledError:
+                raise
+            except JobFailed:
+                raise
+            except Exception as exc:
+                for p in parts:
+                    _unlink_quiet(p)
+                await self._item_error(rec, msg_id, exc,
+                                       context=f"upload msg={msg_id} "
+                                               f"part={idx + 1}")
+                return
+
+        for p in parts:
+            _unlink_quiet(p)
+        self._resolve(rec, msg_id, "sent", f"reupload ({len(parts)} part(s))")
+        self._bump(rec, downloaded=1, uploaded=1)
+        log.info("UL msg=%d ok parts=%d file=%s", msg_id, len(parts), name)
+
+    async def _upload_part(self, rec: JobRecord, control: JobControl,
+                           dst_chat: int, msg: dict, path: str,
+                           caption: str, entities: list[dict],
+                           thumb: tuple | None, start: float) -> None:
+        content = build_input_content(
+            msg, path=path, thumb=thumb,
+            caption_override=caption, entities_override=entities)
+        speedwin = _SpeedWindow()
+        snap = self._snapshot(rec, start, mode="uploading",
+                              filename=os.path.basename(path))
+
+        def on_ul(done: int, total: int) -> None:
+            speedwin.add(done)
+            snap.file_current = done
+            snap.file_total = total
+            snap.speed = speedwin.speed()
+
+        async with self.ul_sem:
+            if control.cancelled:
+                raise asyncio.CancelledError
+            watch = UploadWatch(self.user, path, on_progress=on_ul)
+            try:
+                await send_input(
+                    self.user, dst_chat, content,
+                    timeout=self.cfg.send_timeout)
+            finally:
+                watch.close()
+
+    # -- album ------------------------------------------------------------
+    async def _process_album(self, rec: JobRecord, control: JobControl,
+                             src_chat: int, dst_chat: int, msg_id: int,
+                             fetched: dict[int, dict | None],
+                             album_id: int, start: float) -> None:
+        cfg = self.cfg
+        siblings = [m for m in fetched.values()
+                    if m is not None and int(m.get("media_album_id") or 0)
+                    == album_id]
+        siblings.sort(key=lambda m: int(m["id"]))
+        ids = sorted({int(m["id"]) for m in siblings} | {msg_id})
+
+        self.store.begin_chunk(rec.job_key, ids)
+        staging = self.staging / rec.job_key / f"album_{msg_id}"
+        contents: list[dict] = []
+        downloaded = 0
+
+        async with self.dl_sem:
+            for m in siblings:
+                if control.cancelled:
+                    raise asyncio.CancelledError
+                try:
+                    path, _sz, _el = await download_message_media(
+                        self.user, m, src_chat, staging,
+                        stall_timeout=cfg.download_stall_timeout)
+                except MediaGone as exc:
+                    log.info("album member %s gone: %s", m.get("id"), exc)
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # one broken member aborts the album send (albums are
+                    # all-or-nothing); resolve + stop so resume retries it
+                    for i in ids:
+                        self._resolve_store(
+                            rec, i, "failed", f"album download: {exc}")
+                    self._bump(rec, errors=len(ids))
+                    raise JobFailed(
+                        f"album download failed (msg {msg_id}): "
+                        f"{classify(exc)}") from exc
+                thumb = await download_source_thumbnail(
+                    self.user, content_of(m), staging, int(m["id"]))
+                contents.append(build_input_content(m, path=path,
+                                                    thumb=thumb))
+                downloaded += 1
+
+        if not contents:
+            for i in ids:
+                self._resolve_store(rec, i, "skipped", "album media gone")
+            return
+
+        attempt = 0
+        while True:
+            if control.cancelled:
+                raise asyncio.CancelledError
+            try:
+                async with self.ul_sem:
+                    await send_album(self.user, dst_chat, contents,
+                                     timeout=self.cfg.send_timeout)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                info = classify(exc)
+                if info.kind is ErrorKind.FLOOD_WAIT:
+                    self._bump(rec, flood_waits=1)
+                    await asyncio.sleep(info.wait_seconds)
+                    continue
+                if info.retryable and attempt < self.cfg.retry_count:
+                    attempt += 1
+                    self._bump(rec, retries=1)
+                    await asyncio.sleep(backoff_delay(attempt, rng=self.rng))
+                    continue
+                for i in ids:
+                    self._resolve_store(rec, i, "failed", str(info)[:200])
+                self._bump(rec, errors=len(ids))
+                if info.stop_job:
+                    raise JobFailed(
+                        f"album upload failed (msg {msg_id}): {info}") from exc
+                return
+
+        for i in ids:
+            self._resolve_store(rec, i, "sent", "album")
+        self._bump(rec, downloaded=downloaded, uploaded=len(contents))
+        log.info("album %s: %d/%d sent (msg %d)", album_id, len(contents),
+                 len(siblings), msg_id)
+
+    # -- shared send/retry ------------------------------------------------
+    async def _send_with_retry(self, rec: JobRecord, control: JobControl,
+                               dst_chat: int, msg_id: int,
+                               content: dict, start: float) -> None:
+        """Send one input content with classify-driven retries."""
+        self.store.begin_chunk(rec.job_key, [msg_id])
+        attempt = 0
+        while True:
+            if control.cancelled:
+                raise asyncio.CancelledError
+            try:
+                async with self.ul_sem:
+                    await send_input(self.user, dst_chat, content,
+                                     timeout=self.cfg.send_timeout)
+                self._resolve(rec, msg_id, "sent", "send")
+                self._bump(rec, uploaded=1)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                info = classify(exc)
+                if info.kind is ErrorKind.FLOOD_WAIT:
+                    self._bump(rec, flood_waits=1)
+                    log.warning("msg %d flood-wait %.0fs", msg_id,
+                                info.wait_seconds)
+                    await asyncio.sleep(info.wait_seconds)
+                    continue
+                if info.skip_message:
+                    self._resolve(rec, msg_id, "skipped", str(info)[:200])
+                    self._bump(rec, skipped=1)
+                    return
+                if info.stop_job:
+                    self._resolve(rec, msg_id, "failed", str(info)[:200])
+                    self._bump(rec, errors=1)
+                    raise JobFailed(f"msg {msg_id}: {info}") from exc
+                if attempt < self.cfg.retry_count:
+                    attempt += 1
+                    delay = backoff_delay(attempt, rng=self.rng)
+                    log.info("msg %d retry %d/%d in %.1fs (%s)", msg_id,
+                             attempt, self.cfg.retry_count, delay, info)
+                    self._bump(rec, retries=1)
+                    await asyncio.sleep(delay)
+                    continue
+                self._resolve(rec, msg_id, "failed", str(info)[:200])
+                self._bump(rec, errors=1)
+                raise JobFailed(
+                    f"msg {msg_id} failed after {attempt} retries: {info}"
+                ) from exc
+
+    async def _item_error(self, rec: JobRecord, msg_id: int,
+                          exc: Exception, *, context: str) -> None:
+        """Resolve a per-message failure (marker is 'sending' right now)."""
+        info = classify(exc)
+        log.warning("%s: %s", context, info)
+        if info.kind is ErrorKind.FLOOD_WAIT:
+            # Resolve as failed so the id stays pending (failed ids are
+            # re-yielded by iter_range) — but the job keeps running after
+            # honouring the flood wait, like the legacy loop did.
+            self._resolve(rec, msg_id, "failed", f"flood: {info}"[:200])
+            self._bump(rec, errors=1, flood_waits=1)
+            await asyncio.sleep(info.wait_seconds)
+            return
+        if info.stop_job:
+            self._resolve(rec, msg_id, "failed", str(info)[:200])
+            self._bump(rec, errors=1)
+            raise JobFailed(f"{context}: {info}") from exc
+        if info.skip_message or info.kind is ErrorKind.MISSING_MEDIA:
+            self._resolve(rec, msg_id, "skipped", str(info)[:200])
+            self._bump(rec, skipped=1)
+            return
+        # retryable (network/internal): leave pending for a later pass
+        self._resolve(rec, msg_id, "failed", str(info)[:200])
+        self._bump(rec, errors=1)
+
+    # -- bookkeeping ------------------------------------------------------
+    def _resolve(self, rec: JobRecord, msg_id: int, outcome: str,
+                 detail: str) -> None:
+        self.store.finish_chunk(rec.job_key, {msg_id: (outcome, detail)})
+
+    _resolve_store = _resolve
+
+    def _bump(self, rec: JobRecord, **counters: int) -> None:
+        if counters:
+            self.store.bump(rec.job_key, **counters)
+            for k, v in counters.items():
+                setattr(rec, k, getattr(rec, k, 0) + v)
+
+    # ------------------------------------------------------------------
+    def _snapshot(self, rec: JobRecord, start: float, *,
+                  mode: str = "copy", filename: str = "") -> ProgressSnapshot:
+        # re-read counters: the store is the source of truth (rec may be
+        # stale after finish_chunk updates)
+        fresh = self.store.get_job(rec.job_key) or rec
+        elapsed = time.monotonic() - start
+        done = max(0, fresh.current_msg_id - fresh.start_msg_id)
+        remain = max(0, fresh.end_msg_id - fresh.current_msg_id + 1)
+        avg = elapsed / done if done else 0.0
+        return ProgressSnapshot(
+            job_key=rec.job_key,
+            mode=mode,
+            current_msg=fresh.current_msg_id,
+            total=fresh.total,
+            downloaded=fresh.downloaded,
+            uploaded=fresh.uploaded,
+            skipped=fresh.skipped,
+            errors=fresh.errors,
+            eta=avg * remain,
+            elapsed=elapsed,
+            filename=filename,
+            start_msg=fresh.start_msg_id,
+        )
 
 
-# ── Cleanup ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _parse_identifier(value: str) -> int | str:
+    v = str(value).strip()
+    if v.lstrip("-").isdigit():
+        return int(v)
+    return v.lstrip("@")
 
-def cleanup_file(path: str | None) -> None:
-    """Safely remove a temporary file."""
-    if not path:
-        return
+
+def _unlink_quiet(path: str) -> None:
     try:
-        if os.path.exists(path):
-            os.remove(path)
-    except (OSError, FileNotFoundError):
+        os.unlink(path)
+    except OSError:
         pass
 
 
-def cleanup_job_dir(job_key: str) -> None:
-    """Remove all files for a specific job."""
-    import glob
-    pattern = str(JOB_DIR / f"*{job_key}*")
-    for f in glob.glob(pattern):
-        cleanup_file(f)
+def _split_large(path: str, limit: int) -> list[str]:
+    """Split an oversized file into parts (thread-friendly wrapper)."""
+    try:
+        from file_splitter import split_file
+        parts = split_file(path, limit, None)
+        if isinstance(parts, (list, tuple)) and len(parts) > 1:
+            return list(parts)
+    except Exception:
+        log.warning("split failed for %s", path, exc_info=True)
+    return [path]

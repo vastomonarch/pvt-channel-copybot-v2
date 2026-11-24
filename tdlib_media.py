@@ -531,10 +531,10 @@ def build_input_content(
                     if int(e.get("offset", 0)) < 1024]
     caption = {"@type": "formattedText", "text": text, "entities": entities}
 
-    thumb_content: dict | None = None
+    thumb_input: dict | None = None
     if thumb:
         tpath, tw, th_ = thumb
-        thumb_content = {
+        thumb_input = {
             "@type": "inputThumbnail",
             "thumbnail": _input_file(tpath),
             "width": int(tw or 0),
@@ -551,11 +551,15 @@ def build_input_content(
                 width, height = int(sz.get("width") or 0), int(sz.get("height") or 0)
         return {
             "@type": "inputMessagePhoto",
-            "photo": _input_file(path),
-            "thumbnail": thumb_content,
-            "added_sticker_file_ids": [],
-            "width": width,
-            "height": height,
+            "photo": {
+                "@type": "inputPhoto",
+                "photo": _input_file(path),
+                "thumbnail": thumb_input,
+                "video": None,
+                "added_sticker_file_ids": [],
+                "width": width,
+                "height": height,
+            },
             "caption": caption,
             "show_caption_above_media": bool(
                 content.get("show_caption_above_media")),
@@ -567,16 +571,19 @@ def build_input_content(
         video = content.get("video") or {}
         return {
             "@type": "inputMessageVideo",
-            "video": _input_file(path),
-            "thumbnail": thumb_content,
-            "cover": None,
-            "start_timestamp": int(content.get("start_timestamp") or 0),
-            "added_sticker_file_ids": [],
-            "duration": int(video.get("duration") or 0),
-            "width": int(video.get("width") or 0),
-            "height": int(video.get("height") or 0),
+            "video": {
+                "@type": "inputVideo",
+                "video": _input_file(path),
+                "thumbnail": thumb_input,
+                "cover": None,
+                "start_timestamp": int(content.get("start_timestamp") or 0),
+                "added_sticker_file_ids": [],
+                "duration": int(video.get("duration") or 0),
+                "width": int(video.get("width") or 0),
+                "height": int(video.get("height") or 0),
+                "supports_streaming": bool(video.get("supports_streaming")),
+            },
             "caption": caption,
-            "supports_streaming": bool(video.get("supports_streaming")),
             "show_caption_above_media": bool(
                 content.get("show_caption_above_media")),
             "self_destruct_type": None,
@@ -587,12 +594,15 @@ def build_input_content(
         animation = content.get("animation") or {}
         return {
             "@type": "inputMessageAnimation",
-            "animation": _input_file(path),
-            "thumbnail": thumb_content,
-            "added_sticker_file_ids": [],
-            "duration": int(animation.get("duration") or 0),
-            "width": int(animation.get("width") or 0),
-            "height": int(animation.get("height") or 0),
+            "animation": {
+                "@type": "inputAnimation",
+                "animation": _input_file(path),
+                "thumbnail": thumb_input,
+                "added_sticker_file_ids": [],
+                "duration": int(animation.get("duration") or 0),
+                "width": int(animation.get("width") or 0),
+                "height": int(animation.get("height") or 0),
+            },
             "caption": caption,
             "show_caption_above_media": False,
             "has_spoiler": False,
@@ -602,11 +612,14 @@ def build_input_content(
         audio = content.get("audio") or {}
         return {
             "@type": "inputMessageAudio",
-            "audio": _input_file(path),
-            "album_cover_thumbnail": None,
-            "duration": int(audio.get("duration") or 0),
-            "title": str(audio.get("title") or ""),
-            "performer": str(audio.get("performer") or ""),
+            "audio": {
+                "@type": "inputAudio",
+                "audio": _input_file(path),
+                "album_cover_thumbnail": None,
+                "duration": int(audio.get("duration") or 0),
+                "title": str(audio.get("title") or ""),
+                "performer": str(audio.get("performer") or ""),
+            },
             "caption": caption,
         }
 
@@ -616,7 +629,7 @@ def build_input_content(
             "@type": "inputMessageVoiceNote",
             "voice_note": {
                 "@type": "inputVoiceNote",
-                "voice": _input_file(path),
+                "voice_note": _input_file(path),
                 "duration": int(vn.get("duration") or 0),
                 "waveform": vn.get("waveform") or "",
             },
@@ -630,8 +643,8 @@ def build_input_content(
             "@type": "inputMessageVideoNote",
             "video_note": {
                 "@type": "inputVideoNote",
-                "video": _input_file(path),
-                "thumbnail": thumb_content,
+                "video_note": _input_file(path),
+                "thumbnail": thumb_input,
                 "duration": int(vn.get("duration") or 0),
                 "length": int(vn.get("length") or 0),
             },
@@ -639,13 +652,15 @@ def build_input_content(
         }
 
     # documents (and stickers, which we re-send as documents)
-    document = content.get("document") or {}
     return {
         "@type": "inputMessageDocument",
-        "document": _input_file(path),
-        "thumbnail": thumb_content,
+        "document": {
+            "@type": "inputDocument",
+            "document": _input_file(path),
+            "thumbnail": thumb_input,
+            "disable_content_type_detection": False,
+        },
         "caption": caption,
-        "disable_content_type_detection": False,
     }
 
 

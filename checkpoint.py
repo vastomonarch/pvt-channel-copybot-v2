@@ -63,7 +63,9 @@ _TRANSITIONS: dict[str, frozenset[str]] = {
     "uploading":   frozenset({"running", "downloading", "paused",
                               "cancelling", "completed", "failed"}),
     "paused":      frozenset({"queued", "running", "cancelling", "failed"}),
-    "cancelling":  frozenset({"completed", "failed", "paused"}),
+    # 'running' allowed here only as a post-restart takeover (we hold the
+    # instance lock, so no other process can own the database)
+    "cancelling":  frozenset({"completed", "failed", "paused", "running"}),
     "completed":   frozenset(),
     "failed":      frozenset({"queued", "running"}),   # manual retry
 }
@@ -347,6 +349,40 @@ class JobStore:
         if commit:
             self._conn.commit()
 
+    def bump(self, job_key: str, *, commit: bool = True,
+             **counters: int) -> None:
+        """Atomically increment counter columns (downloaded, uploaded, …).
+
+        ``update_job`` sets columns absolutely; counters must *add*, so a
+        progress read-modify-write can never lose concurrent increments.
+        """
+        allowed = ("downloaded", "uploaded", "skipped", "errors",
+                   "retries", "flood_waits")
+        unknown = set(counters) - set(allowed)
+        if unknown:
+            raise ValueError(f"unknown counters: {sorted(unknown)}")
+        if not counters:
+            return
+        sets = ", ".join(f"{k}={k}+?" for k in counters)
+        self._conn.execute(
+            f"UPDATE jobs SET {sets}, updated_at=? WHERE job_key=?",
+            (*[int(v) for v in counters.values()], time.time(), job_key))
+        if commit:
+            self._conn.commit()
+
+    def reset_failed(self, job_key: str) -> int:
+        """Drop ``failed`` markers so those ids are pending again.
+
+        Called when a job run starts: a previous run stopped at a failure
+        point, and ``.pvtcopydlcontinue`` must retry it (legacy "fix the
+        issue and restart").  Returns the number of markers cleared.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM processed WHERE job_key=? AND outcome=?",
+            (job_key, OUT_FAILED))
+        self._conn.commit()
+        return cur.rowcount
+
     def set_state(self, job_key: str, new_state: str,
                   *, error: str = "") -> None:
         if new_state not in _JOB_STATES:
@@ -504,21 +540,79 @@ class JobStore:
 
     # -- resume helpers -------------------------------------------------
     def iter_range(self, job_key: str, start: int, end: int) -> Iterator[int]:
-        """Yield message ids in ``[start, end]`` with **no** marker at all.
+        """Yield message ids in ``[start, end]`` that still need processing.
 
-        Ids already resolved (``sent``/``skipped``/``failed``) are excluded,
-        and so are ids stuck in ``sending`` — those are ambiguous and must be
-        resolved by the resume recovery path first (see
+        Excludes ids already resolved as ``sent``/``skipped``.  Ids marked
+        ``failed`` ARE yielded again, so ``.pvtcopydlcontinue`` retries the
+        failure point (legacy behaviour: "fix the issue and restart").
+        Ids stuck in ``sending`` are excluded — they are ambiguous and must
+        be resolved by the resume recovery path first (see
         :meth:`ambiguous_messages`), never blindly re-sent or skipped.
         """
         rows = self._conn.execute(
-            """SELECT msg_id FROM processed
+            """SELECT msg_id, outcome FROM processed
                WHERE job_key=? AND msg_id BETWEEN ? AND ?""",
             (job_key, start, end)).fetchall()
-        done = {int(r["msg_id"]) for r in rows}
+        resolved = {int(r["msg_id"]) for r in rows
+                    if r["outcome"] in (OUT_SENT, OUT_SKIPPED, OUT_SENDING)}
         for mid in range(start, end + 1):
-            if mid not in done:
+            if mid not in resolved:
                 yield mid
+
+    def begin_chunk(self, job_key: str, msg_ids: list[int]) -> None:
+        """Mark a whole batch in-flight in one transaction (server-side
+        copy sends message ranges atomically)."""
+        if not msg_ids:
+            return
+        now = time.time()
+        lo = min(msg_ids)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for mid in msg_ids:
+                self._conn.execute(
+                    """INSERT INTO processed(job_key, msg_id, outcome,
+                                             updated_at)
+                       VALUES(?,?,?,?) ON CONFLICT(job_key, msg_id)
+                       DO NOTHING""",
+                    (job_key, mid, OUT_SENDING, now))
+            self._conn.execute(
+                """UPDATE jobs SET current_msg_id=?, updated_at=?
+                   WHERE job_key=? AND current_msg_id < ?""",
+                (lo, now, job_key, lo))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def finish_chunk(self, job_key: str,
+                     outcomes: dict[int, tuple[str, str]]) -> None:
+        """Resolve a whole batch + advance the cursor in one transaction.
+
+        ``outcomes`` maps msg_id → (outcome, detail).  The cursor jumps to
+        ``max(ids)+1`` atomically with the markers, so a crash can never
+        leave the cursor ahead of unresolved markers.
+        """
+        if not outcomes:
+            return
+        now = time.time()
+        hi = max(outcomes)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for mid, (outcome, detail) in outcomes.items():
+                if outcome not in (OUT_SENT, OUT_SKIPPED, OUT_FAILED):
+                    raise ValueError(f"invalid outcome {outcome!r}")
+                self._conn.execute(
+                    """UPDATE processed SET outcome=?, detail=?, updated_at=?
+                       WHERE job_key=? AND msg_id=?""",
+                    (outcome, detail[:500], now, job_key, mid))
+            self._conn.execute(
+                """UPDATE jobs SET current_msg_id=?, updated_at=?
+                   WHERE job_key=? AND current_msg_id <= ?""",
+                (hi + 1, now, job_key, hi))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
 
 # ---------------------------------------------------------------------------
