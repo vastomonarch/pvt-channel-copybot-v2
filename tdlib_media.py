@@ -512,8 +512,13 @@ def build_input_content(
                 "location": dict(content.get("location") or {})}
 
     if ctype == "messageVenue":
-        return {"@type": "inputMessageVenue",
-                "venue": dict(content.get("venue") or {})}
+        # venue.id is a *string* in the TDLib schema; coerce defensively so a
+        # numeric id from any source can't fail JSON parsing with
+        # "Expected String, but receive Number".
+        venue = dict(content.get("venue") or {})
+        if "id" in venue and not isinstance(venue["id"], str):
+            venue["id"] = str(venue["id"])
+        return {"@type": "inputMessageVenue", "venue": venue}
 
     if ctype == "messagePoll":
         return _poll_as_text(content)
