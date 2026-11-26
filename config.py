@@ -79,6 +79,7 @@ class Config:
     max_concurrent_downloads: int = 3
     max_concurrent_uploads: int = 2
     max_queued_jobs: int = 8
+    max_running_jobs: int = 2
     retry_count: int = 4
     request_timeout: float = 60.0         # generic TDLib request timeout (s)
     send_timeout: float = 1800.0          # message send / large upload (s)
@@ -121,6 +122,7 @@ class Config:
             max_concurrent_downloads=_env_int("MAX_CONCURRENT_DOWNLOADS", 3),
             max_concurrent_uploads=_env_int("MAX_CONCURRENT_UPLOADS", 2),
             max_queued_jobs=_env_int("MAX_QUEUED_JOBS", 8),
+            max_running_jobs=_env_int("MAX_RUNNING_JOBS", 2),
             retry_count=_env_int("RETRY_COUNT", 4),
             request_timeout=_env_float("REQUEST_TIMEOUT", 60.0),
             send_timeout=_env_float("SEND_TIMEOUT", 1800.0),
@@ -145,6 +147,8 @@ class Config:
             raise ConfigError("concurrency limits must be >= 1")
         if self.max_queued_jobs < 1:
             raise ConfigError("MAX_QUEUED_JOBS must be >= 1")
+        if self.max_running_jobs < 1:
+            raise ConfigError("MAX_RUNNING_JOBS must be >= 1")
         if self.retry_count < 0:
             raise ConfigError("RETRY_COUNT must be >= 0")
         if not 0 <= self.tdlib_log_verbosity <= 4:
@@ -199,6 +203,7 @@ class Config:
             "max_concurrent_downloads": self.max_concurrent_downloads,
             "max_concurrent_uploads": self.max_concurrent_uploads,
             "max_queued_jobs": self.max_queued_jobs,
+            "max_running_jobs": self.max_running_jobs,
             "retry_count": self.retry_count,
             "request_timeout": self.request_timeout,
             "progress_edit_interval": self.progress_edit_interval,

@@ -72,6 +72,9 @@ class JobSpec:
     end_msg_id: int
     progress_chat_id: int | None = None
     progress_msg_id: int | None = None
+    #: extra record metadata (e.g. ``{"mode": "server_only"}``) carried into
+    #: :attr:`JobRecord.extra` so the runner can pick the right pipeline.
+    extra: dict = field(default_factory=dict)
 
     @property
     def job_key(self) -> str:
@@ -176,14 +179,24 @@ class JobManager:
         key = spec.job_key
         existing = self.store.get_job(key)
         if existing is not None:
-            if existing.state in (JobState.PAUSED, JobState.FAILED):
+            if existing.state == JobState.COMPLETED:
+                # A finished range can be re-issued from scratch (the legacy
+                # implementation deleted ``_meta.json`` on completion, so a
+                # repeat command always started over).  Drop the record and
+                # its markers so the INSERT below cannot collide.
+                log.info("job %s already completed — restarting range",
+                         key)
+                self.store.delete_job(key)
+                existing = None
+            elif existing.state in (JobState.PAUSED, JobState.FAILED):
                 if not fresh:
                     raise DuplicateJobError(
                         f"job {key} is {existing.state}; use "
                         ".pvtcopydlcontinue (or pass fresh=True) to restart")
                 # fresh restart: drop old markers, keep history in `extra`
                 self.store.delete_job(key)
-            else:
+                existing = None
+            if existing is not None:
                 self._ensure_no_duplicate(key)
         self._ensure_capacity()
 
@@ -194,7 +207,7 @@ class JobManager:
             state=JobState.QUEUED,
             progress_chat_id=spec.progress_chat_id,
             progress_msg_id=spec.progress_msg_id,
-            extra={"created_by": "user"},
+            extra={"created_by": "user", **spec.extra},
         )
         self.store.create_job(rec)
         log.info("job queued key=%s src=%s dst=%s range=%d..%d",

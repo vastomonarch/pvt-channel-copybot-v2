@@ -1,8 +1,36 @@
-# System deps (install via package manager, not pip):
-#   ffmpeg, ffprobe  — video splitting
-#   split (coreutils) — binary file splitting
-
-telethon>=1.36.0
+# Python dependencies — TDLib edition.
+#
+# ── Required ──────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
-cryptg>=0.4.0
-aiohttp>=3.9.0
+
+# ── System dependency: libtdjson (NOT a pip package we import) ────────────
+# The bot talks to TDLib through ctypes bindings (tdlib_native.py) and only
+# needs the shared library to exist.  Install ONE of:
+#
+#   1. distro package, e.g.:
+#        Debian/Ubuntu : apt install libtdjson-dev     (or build from source)
+#        Fedora        : dnf install tdjson
+#        Arch          : pacman -S tdlib
+#      → then the bot finds it automatically (find_library("tdjson")),
+#        or point at it explicitly:  TDLIB_LIBRARY_PATH=/usr/lib/libtdjson.so
+#
+#   2. a prebuilt wheel that bundles the library (the bot never imports the
+#      binding itself — it only looks for the .so/.dylib inside the wheel):
+#        pip install tdjson
+#        # or
+#        pip install python-telegram
+#
+#   3. a local build:  TDLIB_LIBRARY_PATH=/path/to/build/libtdjson.so
+#
+# See docs/INSTALL-TDLIB.md for build instructions and troubleshooting.
+#
+# tdjson>=1.8.0            # optional wheel provider of libtdjson
+# python-telegram>=2.0.0   # alternative wheel provider of libtdjson
+
+# ── Optional system tools used by file_splitter.py ───────────────────────
+#   ffmpeg / ffprobe — video splitting (segment muxer)
+#   split (coreutils) — binary file splitting
+#   p7zip (7z)        — archive volume splitting
+#
+# Telethon and cryptg are gone: every Telegram operation now runs through
+# TDLib.  Do not re-add them.

@@ -1,187 +1,200 @@
 #!/usr/bin/env python3
 """
-trigger_pvtcopydl.py — invoke bot.py's .pvtcopydl handler directly.
+trigger_pvtcopydl.py — drive the copy bot headlessly (no Telegram UI).
 
 Why this exists
 ---------------
-bot.py is a long-running Telethon Userbot.  Normally you would interact
-with it by sending `.pvtcopydl <start> <end>` to your own Telegram chat
-from your phone.  In a headless environment we can't do that, so we
-import the module, bring up both Telethon clients (user account + bot),
-and call the registered handler with a synthetic NewMessage event.
+bot.py is a long-running TDLib service.  Normally you interact with it by
+sending `.pvtcopydl <start> <end>` from your phone.  In a headless
+environment (CI, a server without Telegram installed, smoke tests) you can
+issue the very same command from the shell instead::
 
-The synthetic event satisfies the surface that the handler actually
-touches on:
+    python trigger_pvtcopydl.py .pvtcopydl https://t.me/c/123/4 https://t.me/c/123/50
+    python trigger_pvtcopydl.py .pvtcopy   https://t.me/c/123/4 https://t/me/c/123/50
+    python trigger_pvtcopydl.py .pvtcopydlcontinue ab12cd34ef56
+    python trigger_pvtcopydl.py --list
 
-    event.pattern_match.group(i)            – regex match groups
-    await event.respond(text)               – returns a status_msg
-    status_msg.edit(text)                   – live progress updates
+What it does
+------------
+1. boots the **real** ``CopyBot`` (TDLib clients, login, job manager) —
+   the identical code path a Telegram message would take, only the update
+   routing is skipped;
+2. dispatches the command into a chat (``--chat``, else the paired bot
+   progress chat from ``.progress_chat``);
+3. watches the job store until the job reaches a terminal state, printing
+   a status line every few seconds;
+4. shuts TDLib down gracefully and exits ``0`` on completion, ``1``
+   otherwise.
 
-Everything else (Telethon API calls, Bot-driven progress callbacks,
-FileReferences, FloodWaits) is the real bot.py code path.
+There is **no** Telethon, no synthetic events and no session-file
+patching: sessions are TDLib databases under ``data/tdlib/``.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
-import re
+import pathlib
 import sys
-import traceback
+import time
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT)
-# Anchor cwd to the project root so `load_dotenv()` finds `.env` even when
-# this script is launched from a tmux pane whose cwd may differ.
+ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+# Anchor cwd to the project root so load_dotenv() finds .env even when this
+# script is launched from elsewhere.
 os.chdir(ROOT)
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+from checkpoint import JobState, JobStore  # noqa: E402
+from config import Config, ConfigError  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Workaround: enable WAL journal mode on the Telethon SQLite session files.
-#
-# The project lives on an overlayfs mount, which is known to mishandle the
-# POSIX fcntl advisory locks SQLite uses when it first escalates to an
-# EXCLUSIVE lock (Telethon triggers this during `connect()` with
-# `delete from sessions`).  After any SIGKILL of a previous bot process
-# the overlayfs lock state drags, so the next process boots into
-# `sqlite3.OperationalError: database is locked`.
-#
-# Switching the database to WAL (Write-Ahead Logging) is persistent — the
-# change is written into the SQLite header — so it survives process
-# restarts.  WAL uses a `-wal` file plus a `-shm` shared-memory index and
-# never needs exclusive DB-level locks for normal reads, so the overlayfs
-# fcntl bug is bypassed entirely.  Auth keys are preserved.
-# ---------------------------------------------------------------------------
-def _enable_wal_journal(path: str) -> None:
-    import sqlite3
-    if not os.path.exists(path):
-        print(f"[trigger] session file absent, skipping WAL setup: {path}")
-        return
+TERMINAL = {JobState.COMPLETED, JobState.FAILED}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="trigger_pvtcopydl",
+        description="issue a copy-bot command headlessly and wait for it",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("examples:\n"
+                "  trigger_pvtcopydl.py .pvtcopydl "
+                "https://t.me/c/1/4 https://t.me/c/1/50\n"
+                "  trigger_pvtcopydl.py --chat -100123 .pvtcopy "
+                "https://t.me/c/1/4 https://t.me/c/1/50\n"
+                "  trigger_pvtcopydl.py --list\n"))
+    p.add_argument("command", nargs="?",
+                   help="the command to run, e.g. .pvtcopydl <start> <end>")
+    p.add_argument("rest", nargs="*",
+                   help="remaining words of the command (links, job key)")
+    p.add_argument("--chat", type=int, default=None, metavar="ID",
+                   help="chat that receives the status message "
+                        "(default: the paired bot progress chat)")
+    p.add_argument("--timeout", type=float, default=3600.0, metavar="SEC",
+                   help="give up after this many seconds (default 3600)")
+    p.add_argument("--poll", type=float, default=5.0, metavar="SEC",
+                   help="status print interval (default 5)")
+    p.add_argument("--list", action="store_true",
+                   help="list known jobs and exit (no login needed)")
+    return p.parse_args(argv)
+
+
+def list_jobs() -> int:
+    """`--list`: open the checkpoint DB only (no TDLib, no login)."""
+    cfg = Config.from_env()
+    if not cfg.jobs_db_path.exists():
+        print(f"no job database at {cfg.jobs_db_path}")
+        return 0
+    store = JobStore(cfg.jobs_db_path)
     try:
-        # isolation_level=None keeps autocommit, so the PRAGMA persists
-        # without us having to remember to commit.
-        c = sqlite3.connect(path, timeout=5, isolation_level=None)
-        mode = c.execute("PRAGMA journal_mode=WAL;").fetchone()[0]
-        # NORMAL is the recommended pairing for WAL — full FSYNC on each
-        # commit is unnecessary and slower.
-        c.execute("PRAGMA synchronous=NORMAL;")
-        c.close()
-        print(f"[trigger] set {mode!r} journal_mode on {path}")
-    except Exception as e:
-        print(f"[trigger] WAL setup failed for {path}: {type(e).__name__}: {e}")
+        jobs = store.list_jobs()
+        if not jobs:
+            print("no jobs recorded")
+            return 0
+        print(f"{'key':12} {'state':12} {'range':>16} {'cursor':>10} "
+              f"{'sent':>6} {'skip':>5} {'err':>4}  src → dst")
+        for j in jobs:
+            print(f"{j.job_key:12} {j.state:12} "
+                  f"{f'{j.start_msg_id}..{j.end_msg_id}':>16} "
+                  f"{j.current_msg_id:>10} {j.uploaded:>6} "
+                  f"{j.skipped:>5} {j.errors:>4}  {j.src} → {j.dst}")
+        return 0
+    finally:
+        store.close()
 
 
-# Enable WAL journal on all session files
-for _sess_name in ("copybot_session.session", "copybot_bot_session.session"):
-    _enable_wal_journal(os.path.join(ROOT, _sess_name))
-_sessions_dir = os.path.join(ROOT, "sessions")
-if os.path.isdir(_sessions_dir):
-    for _sess_file in os.listdir(_sessions_dir):
-        if _sess_file.endswith(".session"):
-            _enable_wal_journal(os.path.join(_sessions_dir, _sess_file))
-
-# Importing bot.py triggers its module-level wiring (clients, globals, env
-# loading, config).  We just import, we don't yet connect.
-from bot import (  # noqa: E402
-    client,
-    bot_client,
-    BOT_TOKEN,
-    handle_pvtcopydl,
-    _register_bot_handlers,
-)
-
-# The exact command the user asked for.
-CMD = (
-    ".pvtcopydl "
-    "https://t.me/c/3854998856/3 "
-    "https://t.me/c/3854998856/234"
-)
+async def _wait_for_job(bot, key: str, *, timeout: float,
+                        poll: float) -> str:
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        rec = bot.store.get_job(key)
+        if rec is None:
+            return "gone"
+        line = (f"[state={rec.state}] cursor {rec.current_msg_id}/"
+                f"{rec.end_msg_id} sent={rec.uploaded} "
+                f"skip={rec.skipped} err={rec.errors} "
+                f"retries={rec.retries} flood={rec.flood_waits}")
+        if line != last:
+            print(line, flush=True)
+            last = line
+        if rec.state in TERMINAL:
+            return rec.state
+        await asyncio.sleep(poll)
+    return "timeout"
 
 
-class FakeStatusMsg:
-    """Mimics the Telethon Message object returned by `event.respond(...)`.
+async def run_command(args: argparse.Namespace) -> int:
+    from bot import CopyBot, get_progress_chat_id
 
-    bot.py calls `.edit(text, buttons=...)` on this object several times
-    while the job runs; printing each edit lets us see the live progress
-    in stdout without needing the user to /pvtcopy a personal account.
-    """
+    cfg = Config.from_env()
+    bot = CopyBot(cfg)
+    rc = await bot.start()
+    if rc != 0:
+        print("[trigger] startup failed", file=sys.stderr)
+        return rc
 
-    def __init__(self, text: str) -> None:
-        self.text = text
-        print(f"[STATUS] {text}")
+    chat_id = args.chat if args.chat is not None else get_progress_chat_id()
+    if not chat_id:
+        print("[trigger] no chat target: pass --chat <id> or send the bot "
+              "/start once so .progress_chat exists", file=sys.stderr)
+        await bot._shutdown("trigger")
+        return 2
 
-    async def edit(self, text, **kwargs) -> "FakeStatusMsg":
-        self.text = text
-        print(f"[STATUS] {text}")
-        return self
+    before = {j.job_key for j in bot.store.list_jobs()}
+    text = " ".join([args.command, *args.rest]).strip()
+    print(f"[trigger] dispatching {text!r} → chat {chat_id}", flush=True)
+    t0 = time.monotonic()
+    await bot._dispatch_command(chat_id, text)
 
-    async def delete(self) -> None:
-        pass
+    new_jobs = [j for j in bot.store.list_jobs()
+                if j.job_key not in before]
+    if not new_jobs:
+        print("[trigger] no job was created (bad links / duplicate / "
+              "no destination?)", file=sys.stderr)
+        await bot._shutdown("trigger")
+        return 1
+    key = new_jobs[-1].job_key
+    print(f"[trigger] job {key} created; waiting …", flush=True)
+
+    state = await _wait_for_job(bot, key, timeout=args.timeout,
+                                poll=args.poll)
+    elapsed = time.monotonic() - t0
+    rec = bot.store.get_job(key)
+    print(f"[trigger] job {key} → {state} after {elapsed:.1f}s "
+          f"(sent={rec.uploaded if rec else '?'} "
+          f"skip={rec.skipped if rec else '?'} "
+          f"err={rec.errors if rec else '?'})", flush=True)
+
+    await bot._shutdown("trigger")
+    return 0 if state == JobState.COMPLETED else 1
 
 
-class FakeMessage:
-    """Mimics a Telethon Message for the FakeEvent."""
-    def __init__(self, text: str):
-        self.text = text
-
-
-class FakeEvent:
-    """Mimics a Telethon NewMessage event for the .pvtcopydl pattern."""
-
-    def __init__(self, text: str) -> None:
-        m = re.match(r"\.pvtcopydl\s+(\S+)\s+(\S+)", text)
-        if not m:
-            raise RuntimeError(f"command does not match .pvtcopydl pattern: {text!r}")
-        self.pattern_match = m
-        self.message = FakeMessage(text)
-
-    async def respond(self, msg, **kwargs) -> FakeStatusMsg:
-        return FakeStatusMsg(msg)
-
-
-async def main() -> None:
-    # Set these globals that main() in bot.py normally sets; bot.py's
-    # handle_pvtcopydl references ME_ID when the .progress_chat cache is
-    # empty.  Better to set them ourselves so we don't depend on bot.py
-    # having been run first.
-    import bot as botmod
-    botmod._progress_chat_id = None  # force re-read from .progress_chat
-    botmod._progress_chat_loaded = False
-
-    print(f"[trigger] python={sys.version.split()[0]} cwd={os.getcwd()}")
-    print("[trigger] starting userbot client (session=copybot_session)…")
-    await client.start()
-    me = await client.get_me()
-    botmod.ME_ID = me.id
-    print(f"[trigger] userbot OK: {me.first_name} (id={me.id})")
-
-    if bot_client is not None and BOT_TOKEN:
-        print("[trigger] starting bot_client (bot_token)…")
-        await bot_client.start(bot_token=BOT_TOKEN)
-        bot_me = await bot_client.get_me()
-        botmod.BOT_USERNAME = bot_me.username
-        botmod.BOT_ID = bot_me.id
-        # Wire the bot-side Refresh / Cancel / /start callbacks so the
-        # inline buttons on the live progress message actually work.  This
-        # is the same call bot.py's main() makes on first run.
-        _register_bot_handlers()
-        print(f"[trigger] bot_client OK: @{bot_me.username} (id={bot_me.id})")
-    else:
-        print("[trigger] bot_client disabled (no BOT_TOKEN in .env)")
-
-    evt = FakeEvent(CMD)
-    print(f"[trigger] invoking handle_pvtcopydl for: {CMD}")
-    await handle_pvtcopydl(evt)
-    print("[trigger] handle_pvtcopydl returned cleanly")
+def main() -> int:
+    args = parse_args()
+    if args.list:
+        try:
+            return list_jobs()
+        except ConfigError as exc:
+            print(f"config error: {exc}", file=sys.stderr)
+            return 2
+    if not args.command:
+        print("usage: trigger_pvtcopydl.py <command> [args…]  "
+              "(or --list)", file=sys.stderr)
+        return 2
+    if not args.command.startswith("."):
+        print("command must start with '.' (e.g. .pvtcopydl)",
+              file=sys.stderr)
+        return 2
+    try:
+        return asyncio.run(run_command(args))
+    except KeyboardInterrupt:
+        print("[trigger] interrupted", file=sys.stderr)
+        return 130
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("[trigger] KeyboardInterrupt — exiting")
-    except Exception as e:
-        print(f"[trigger] FATAL: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(main())

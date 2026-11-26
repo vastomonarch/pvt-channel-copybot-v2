@@ -185,7 +185,8 @@ class CopyPipeline:
                  dl_sem: asyncio.Semaphore, ul_sem: asyncio.Semaphore,
                  progress: ProgressSink | None = None,
                  staging_dir: Path | None = None,
-                 rng: random.Random | None = None):
+                 rng: random.Random | None = None,
+                 server_only: bool = False):
         self.cfg = cfg
         self.store = store
         self.user = user
@@ -195,6 +196,7 @@ class CopyPipeline:
         self.progress = ThrottledProgress(progress, cfg.progress_edit_interval)
         self.staging = Path(staging_dir or cfg.staging_dir)
         self.rng = rng or random.Random()
+        self.server_only = server_only
         self.spinner = Spinner()
         # ids that exhausted retries during THIS run: excluded from pending
         # so the loop can't spin on them; their 'failed' markers are cleared
@@ -332,6 +334,11 @@ class CopyPipeline:
                 continue
             if control.cancelled:
                 raise asyncio.CancelledError
+            if self.server_only:
+                # .pvtcopy never re-uploads: refuse instead of falling back.
+                raise JobFailed(
+                    f"msg {pending[0]}: server-side copy unavailable "
+                    "(forwarding restricted?) — use .pvtcopydl")
 
             # --- per-message fallback (download + re-upload) ------------
             msg_id = pending[0]
@@ -383,6 +390,7 @@ class CopyPipeline:
         if skipped:
             self.store.begin_chunk(rec.job_key, list(skipped))
             self.store.finish_chunk(rec.job_key, skipped)
+            self._bump(rec, skipped=len(skipped))
             for mid in sorted(skipped):
                 log.info("msg %d: skipped (%s)", mid, skipped[mid][1])
         if not resolvable:
@@ -402,6 +410,9 @@ class CopyPipeline:
                                 len(sent), len(resolvable))
                 self.store.finish_chunk(rec.job_key, {
                     mid: ("sent", "server copy") for mid in resolvable})
+                # server-side copy is a "send" like any other: count it so
+                # the completion screen shows Copied N rather than 0
+                self._bump(rec, uploaded=len(resolvable))
                 for mid in resolvable:
                     log.info("COPY msg=%d → server-side", mid)
                 await self.progress.emit(
@@ -532,7 +543,8 @@ class CopyPipeline:
         try:
             if os.path.getsize(path) > cfg.max_single_file_bytes:
                 parts = await asyncio.to_thread(
-                    _split_large, path, cfg.max_single_file_bytes)
+                    _split_large, path, cfg.max_single_file_bytes,
+                    cfg.split_verify_hash)
                 if len(parts) > 1:
                     log.info("split %s → %d parts", name, len(parts))
         except OSError as exc:
@@ -817,11 +829,11 @@ def _unlink_quiet(path: str) -> None:
         pass
 
 
-def _split_large(path: str, limit: int) -> list[str]:
+def _split_large(path: str, limit: int, verify: bool = False) -> list[str]:
     """Split an oversized file into parts (thread-friendly wrapper)."""
     try:
         from file_splitter import split_file
-        parts = split_file(path, limit, None)
+        parts = split_file(path, limit, None, verify_hash=verify)
         if isinstance(parts, (list, tuple)) and len(parts) > 1:
             return list(parts)
     except Exception:

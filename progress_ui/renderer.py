@@ -10,6 +10,7 @@ from progress_ui.constants import (
     ICON_CANCEL,
     ICON_CHANNEL,
     ICON_COMPLETE,
+    ICON_COPY,
     ICON_DELETE,
     ICON_DOWNLOAD,
     ICON_ELAPSED,
@@ -92,6 +93,9 @@ def render_copy_progress(
     if mode == "uploading":
         arrow = ICON_UPLOAD
         action = "Uploading"
+    elif mode == "copy":
+        arrow = ICON_COPY
+        action = "Copying"
     elif mode == "downloading":
         arrow = ICON_DOWNLOAD
         action = "Downloading"
@@ -162,7 +166,12 @@ def render_copy_completed(
 ) -> str:
     """Render the copy completion screen."""
     bar = progress_bar(100.0, width=20)
-    action = "Uploaded" if mode == "upload" else "Downloaded"
+    if mode in ("upload", "uploading"):
+        action = "Uploaded"
+    elif mode == "copy":
+        action = "Copied"
+    else:
+        action = "Downloaded"
 
     lines = [
         box_top(width),
