@@ -13,6 +13,9 @@
 .progress_chat
 .pvtcopydl_*.json
 _pvtcopydl_tmp/
+data/
+tdlib/
+venv/
 
 # ── Python ───────────────────────────────────────────────────────────
 __pycache__/

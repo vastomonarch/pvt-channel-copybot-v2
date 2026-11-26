@@ -39,6 +39,6 @@ Contributions are welcome! Here's how to get started.
 ## Reporting Issues
 
 - Use GitHub Issues
-- Include Python version and Telethon version
+- Include Python version, OS, and the TDLib version (`libtdjson` path/version)
 - Describe steps to reproduce
-- Include relevant log output (redact any tokens/keys)
+- Include relevant log output (redact any tokens/keys, phone numbers, channel IDs)

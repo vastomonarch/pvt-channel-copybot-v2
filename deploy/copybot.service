@@ -1,0 +1,48 @@
+# systemd unit for the TDLib copy bot.
+#
+# install.sh renders this file with your checkout path and user, then
+# installs it to /etc/systemd/system/copybot.service.  If you install it
+# by hand, replace BOTH occurrences of /opt/pvt-channel-copybot-v2 and the
+# User=/Group= values.
+
+[Unit]
+Description=Private Channel Copy Bot (TDLib)
+Documentation=https://github.com/vastomonarch/pvt-channel-copybot-v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=copybot
+Group=copybot
+WorkingDirectory=/opt/pvt-channel-copybot-v2
+EnvironmentFile=/opt/pvt-channel-copybot-v2/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/pvt-channel-copybot-v2/venv/bin/python bot.py
+
+# Graceful shutdown: the bot installs a SIGTERM handler that cancels jobs
+# cooperatively, closes both TDLib clients and releases the session locks.
+# Never use SIGKILL as the stop signal — it would strand job rows in
+# `running` (they are recovered as `paused` on the next start, but the
+# in-flight message could be ambiguous).
+KillSignal=SIGTERM
+KillMode=mixed
+# Must exceed SHUTDOWN_TIMEOUT (20s) + TDLib close budget (10s) + margin.
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+# stdout/stderr go to the journal:  journalctl -u copybot -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=copybot
+
+# Hardening (relax ProtectSystem if your checkout lives under /etc)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# ProtectHome=true          # uncomment if the checkout is NOT in /home
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

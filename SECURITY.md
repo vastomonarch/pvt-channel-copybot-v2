@@ -17,12 +17,15 @@ This bot handles Telegram API credentials and session files. **Never commit:**
 
 Always use `.env.example` and `config.example.json` as templates.
 
-## Session Files
+## Session & Runtime Data
 
-Telethon session files (`*.session`) contain authentication keys that grant
-full access to your Telegram account. Treat them like passwords:
-
-- Never share session files
-- Never commit them to version control
-- Delete them if compromised
-- Use `.logout` command to invalidate sessions
+- **`data/tdlib/`** contains TDLib account databases and key material that
+  grant full access to the authenticated Telegram account. Treat it like a
+  password.
+- **Legacy Telethon `*.session` files** (from pre-migration installs) also
+  contain authentication keys. The migration never deletes them; treat them
+  as sensitive and do not commit them.
+- Never share session data, never commit it, and restrict filesystem
+  permissions on `data/` and `.env`.
+- Use `.logout` to log the account out of Telegram; remove `data/tdlib/`
+  only when you intentionally want a fresh login.
